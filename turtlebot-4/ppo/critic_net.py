@@ -1,6 +1,8 @@
 import tensorflow as tf
 from tensorflow.keras import layers
 import numpy as np
+import matplotlib.pyplot as plt
+
 
 
 def world_to_map(world_coords, resolution, origin, map_offset, map_shape):
@@ -86,7 +88,7 @@ class ImprovedCritic(tf.keras.Model):
         super(ImprovedCritic, self).__init__()
         self.grid_map = grid_map
         self.optimal_path = optimal_path
-        self.value_map = None
+        # self.value_map = None
 
         # На вход подаем состояние плюс один дополнительный признак (отклонение + штраф)
         self.rb1 = ResBlock(state_dim-2, state_dim-2, n_neurons)
@@ -140,10 +142,12 @@ class ImprovedCritic(tf.keras.Model):
         output = self.out(x)
         return output
     
-    def initialize_value_map(self):
+    def initialize_value_map(self, grid_map):
         """ Вычисляет value_map после полной инициализации модели. """
-        self.value_map = self.precompute_value_map(self.grid_map)
+        value_map = np.zeros(grid_map.shape, dtype=np.float32)
+        value_map = self.precompute_value_map(self.grid_map)
         print('Сетка критика построена!')
+        return value_map
 
     def precompute_value_map(self, grid_map):
         """ Заполняем таблицу значений критика для всех точек grid_map """
@@ -152,9 +156,27 @@ class ImprovedCritic(tf.keras.Model):
 
         for y in range(height):
             for x in range(width):
-                state = np.array([x, y], dtype=np.float32)  # Пример состояния
+                state = np.array([x, y], dtype=np.float32)  
                 state = np.reshape(state, (1, -1))  
                 value_map[y, x] = self.call(state).numpy().flatten()[0]  # Получаем оценку критика
+                print(f"({x}, {y}) -> {value_map[y, x]}")
+
+        for path_point in self.optimal_path:
+            x_p, y_p = int(path_point[0]), int(path_point[1])
+            if 0 <= x_p < width and 0 <= y_p < height:
+                value_map[y_p, x_p] += 10.0  # Увеличиваем ценность (можно менять вес)
+
+        value_map = value_map.astype(np.float32)    
+        # print(type(value_map))  # Должно быть <class 'numpy.ndarray'>
+        # print(value_map.dtype)  # Должно быть float32 или float64
+        # print(value_map.shape)  # Должно быть (100, 100)
+
+        # print(np.isnan(value_map).sum(), np.isinf(value_map).sum()) 
+
+        # print(value_map) 
+
+        # value_map = np.array(value_map, dtype=np.float32)
+        # print(value_map.dtype)
 
         return value_map
 
@@ -195,17 +217,18 @@ class ImprovedCritic(tf.keras.Model):
     #     # print(state)
     #     return self.call(state, deviation, collision_penalty)
 
-    def eval_value(self, state, grid_map):
-        """ Извлекаем оценку из предобученной карты значений """
-        # print(state)
+    def eval_value(self, state, grid_map, value_map):
+        """ Извлекаем оценку из предобученной карты значений с учетом направления к цели """
+        
         if state.ndim == 2 and state.shape[0] == 1:
             state = state[0] 
-        state_nt = world_to_map(state[:2], resolution = 0.05, origin = (-4.86, -7.36),  map_offset = (45, 15), map_shape = grid_map.shape)
+            
+        state_nt = world_to_map(state[:2], resolution=0.05, origin=(-4.86, -7.36),
+                                map_offset=(45, 15), map_shape=grid_map.shape)
         x, y = state_nt[0], state_nt[1]
-        value = self.value_map[y, x]  # Используем предвычисленные оценки
-        angle_penalty = np.abs(state[2]) / np.pi  # Чем больше разница, тем хуже
-        ret = value * np.exp(-angle_penalty)
-        return ret
+        value = value_map[y, x]  # Используем предвычисленные оценки
+
+        return value 
 
     # def is_near_obstacle(self, point, safe_distance=2):
     #     """
@@ -228,3 +251,20 @@ class ImprovedCritic(tf.keras.Model):
 
     #     area = self.grid_map[y_min:y_max, x_min:x_max]
     #     return np.any(area == 1)
+
+class StaticCritic:
+    def __init__(self, value_map, grid_map):
+        self.value_map = value_map
+        self.grid_map = grid_map
+
+    def call(self, state):
+        """ Получаем значение критика из предвычисленной карты """
+        if state.ndim == 2 and state.shape[0] == 1:
+            state = state[0] 
+        x, y = state[:2]  # Берём координаты состояния
+        x_map, y_map = world_to_map((x, y), resolution=0.05, origin=(-4.86, -7.36),
+                                    map_offset=(45, 15), map_shape=self.grid_map.shape)
+        return self.value_map[y_map, x_map]  # Достаём значение из таблицы
+    
+
+    

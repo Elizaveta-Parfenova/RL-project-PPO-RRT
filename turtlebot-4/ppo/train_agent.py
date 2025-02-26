@@ -5,36 +5,51 @@ from tensorflow.keras import layers
 import rclpy
 from my_turtlebot_package.turtlebot_env import TurtleBotEnv
 from my_turtlebot_package.actor_net import ImprovedActor
-from my_turtlebot_package.critic_net import ImprovedCritic
+from my_turtlebot_package.critic_net import ImprovedCritic, StaticCritic, world_to_map
 from my_turtlebot_package.config import TARGET_X, TARGET_Y
 import cv2
 import matplotlib.pyplot as plt
+from scipy.ndimage import distance_transform_edt
 
 
-# def slam_to_grid_map(slam_map, threshold=128):
 
-#     grid_map = np.where(slam_map < threshold, 1, 0)  
-#     num_obstacles = np.count_nonzero(grid_map == 1)
+def precompute_value_map(grid_map, optimal_path, goal, path_weight=3.0, obstacle_weight=4.0, goal_weight = 3.0):
+        """ Заполняем таблицу значений критика для всех точек grid_map """
+        height, width = grid_map.shape
+        value_map = np.zeros((height, width))
 
-#     # print(num_obstacles)
-    
-#     # Визуализация grid_map
-#     # plt.figure(figsize=(8, 8))
-#     # plt.imshow(grid_map, cmap='gray')
-#     # plt.title(f'Grid Map с порогом {threshold}')
-#     # plt.axis('off')
-#     # plt.show()
-    
-#     return grid_map
+        # Вычисляем расстояние от каждой точки карты до ближайшего препятствия
+        obstacle_mask = (grid_map == 1)
+        obstacle_distances = distance_transform_edt(~obstacle_mask)  # Чем ближе к препятствию, тем меньше значение
 
-# # def map_to_world(map_coords, resolution, origin):
-# #     x_map, y_map = map_coords
-# #     x_world = x_map * resolution + origin[0]
-# #     y_world = y_map * resolution + origin[1]
-# #     return (x_world, y_world)
+        # Вычисляем расстояние от каждой точки до ближайшей точки пути
+        path_mask = np.zeros_like(grid_map, dtype=bool)
+        for x, y in optimal_path:  # optimal_path — список (x, y)
+            path_mask[y, x] = True
+        path_distances = distance_transform_edt(~path_mask)  # Чем ближе к пути, тем меньше значение
 
-# slam_map = cv2.imread('map.pgm', cv2.IMREAD_GRAYSCALE)
-# grid_map = slam_to_grid_map(slam_map)
+        goal_x, goal_y = world_to_map(goal, resolution=0.05, origin=(-4.86, -7.36),
+                                    map_offset=(45, 15), map_shape= grid_map.shape)
+        # print(goal_x, goal_y)
+        goal_mask = np.zeros_like(grid_map, dtype=bool)
+        goal_mask[goal_y, goal_x] = True
+        goal_distances = distance_transform_edt(~goal_mask)  # Чем ближе к цели, тем меньше значение
+
+        # obstacle_distances = np.clip(obstacle_distances, 0, 5)  # Обрезаем максимальные значения
+        # path_distances = np.clip(path_distances, 0, 5)
+        # goal_distances = np.clip(goal_distances, 0, 5)
+
+        # Создаём градиентное поле
+        value_map = -path_distances * path_weight + obstacle_distances * (obstacle_weight / (obstacle_distances + 0.1)) - goal_distances * goal_weight
+
+        return value_map
+
+def plot_value_map(value_map):
+        plt.figure(figsize=(8, 6))
+        plt.imshow(value_map, cmap="viridis")
+        plt.colorbar(label="Value")
+        plt.title("Critic Value Map")
+        plt.show()
 
 # --- Класс агента PPO ---
 class PPOAgent:
@@ -61,18 +76,29 @@ class PPOAgent:
         self.actor_lr = 0.0003
         self.critic_lr = 0.0003
         self.gaelam = 0.95
+        self.alpha = 0.8 
 
         # Модели
         self.actor = ImprovedActor(self.state_dim, self.action_dim)
         self.critic = ImprovedCritic(self.state_dim, grid_map=self.grid_map, optimal_path=self.optimal_path)
-        self.value_map = self.critic.initialize_value_map()  
+        self.value_map = precompute_value_map(self.grid_map, self.optimal_path, self.goal)
+        self.critic = StaticCritic(self.value_map, self.grid_map)
+        # self.value_map = self.critic.initialize_value_map(grid_map=self.grid_map)  
+        
+        # print(type(self.value_map))  # Должно быть <class 'numpy.ndarray'>
+        # print(self.value_map.dtype)  # Должно быть float32 или float64
+        # print(self.value_map.shape)
+
+        # print(self.value_map)
+
+        plot_value_map(self.value_map)
 
         # Оптимизаторы
         self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=self.actor_lr)
-        self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=self.critic_lr)
+        # self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=self.critic_lr)
 
     # Выбор действия и его вероятность
-    def get_action(self, state):
+    def get_action(self, state, value_map):
         state = np.reshape(state, [1, self.state_dim])
         prob = self.actor(state).numpy().squeeze()
         prob = np.nan_to_num(prob, nan=1.0/self.action_dim)
@@ -81,14 +107,19 @@ class PPOAgent:
         action_values = np.zeros(self.action_dim)
 
         for action in range(self.action_dim):
-            next_state = self.env.get_next_state(state, action)  # Функция для предсказания следующего состояния
-            action_values[action] = self.critic.eval_value(next_state, self.grid_map)
+            next_state = self.env.get_next_state(state, action)
+            future_state = self.env.get_next_state(next_state, action)  # Предсказание на два шага вперёд
+
+            value_now = self.critic.call(next_state)
+            value_future = self.critic.call(future_state)
+
+            action_values[action] = value_now + 0.5 * value_future  # Учитываем будущее
 
         # Нормализация оценок критика
         action_values = (action_values - np.min(action_values)) / (np.max(action_values) - np.min(action_values) + 1e-10)
 
         # Комбинация вероятностей и оценок критика
-        combined_scores = 0.3 * prob + 0.7 * action_values
+        combined_scores = 0.5 * prob + 0.5 * action_values
 
         # Выбор наилучшего действия
         action = np.argmax(combined_scores)
@@ -177,7 +208,7 @@ class PPOAgent:
             states, actions, rewards, dones, probs, values = [], [], [], [], [], []
 
             while not done:
-                action, prob = self.get_action(state)
+                action, prob = self.get_action(state, self.value_map)
                 # print('Action:', action)
                 # print('Prob:', prob)
                 next_state, reward, done, _ = self.env.step(action)
@@ -191,7 +222,7 @@ class PPOAgent:
                 # print(next_state)
                 # print(self.goal)
                 # print(self.obstacles)
-                value = self.critic.eval_value(state, self.grid_map)
+                value = self.critic.call(state)
                 # print(f"Critic value for state {state}: {self.critic.eval_value(state, self.grid_map)}")
 
                 states.append(state)
@@ -206,7 +237,7 @@ class PPOAgent:
                 # print(episode_reward)
                 
                 # if len(states) >= batch_size:
-            next_value = self.critic.eval_value(next_state, self.grid_map)
+            next_value = self.critic.call(next_state)
             values.append(next_value)
             # print(values)
             advantages, returns = self.compute_advantages(rewards, values, dones)

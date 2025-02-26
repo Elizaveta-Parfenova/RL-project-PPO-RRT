@@ -16,7 +16,7 @@ class Node:
 # Класс RRTStar
 # ------------------------------
 class RRTStar:
-    def __init__(self, start, goal, grid_map, max_iter=1000, step_size=5, goal_sample_rate=0.2, search_radius=None):
+    def __init__(self, start, goal, grid_map, max_iter=10000, step_size=0.6, goal_sample_rate=0.2, search_radius=None):
         """
         :param start: Стартовая точка (x, y)
         :param goal: Целевая точка (x, y)

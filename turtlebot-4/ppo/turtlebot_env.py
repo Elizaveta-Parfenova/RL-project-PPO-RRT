@@ -345,7 +345,7 @@ class TurtleBotEnv(Node, gym.Env):
         # min_obstacle_dist остаётся прежним (или можно пересчитывать)
         return np.array([next_x, next_y, next_angle, min_obstacle_dist], dtype=np.float32)
 
-    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=0.5, k_rep=5.0, d0=1.2, lam=0.5):
+    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=0.5, k_rep=5.0, d0=1.1, lam=0.5):
         current_x, current_y, _, min_obstacle_dist = state
 
         # Преобразуем координаты в пиксельные
@@ -360,7 +360,7 @@ class TurtleBotEnv(Node, gym.Env):
         goal_x, goal_y = world_to_map(goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape)
 
         # Потенциал в текущей точке
-        potential_value = self.potential_field[current_y, current_x]  # поменял индексы
+        potential_value = self.potential_field[current_y, current_x] 
         delta_potential = self.prev_potential - potential_value  # уменьшение потенциала - хорошо
         R_potential = max(-delta_potential, -1)  # если двигаемся в правильном направлении - награда, иначе штраф
 
@@ -384,8 +384,19 @@ class TurtleBotEnv(Node, gym.Env):
         grad_y, grad_x = np.gradient(self.potential_field)
         local_grad_x = grad_x[current_y, current_x]
         local_grad_y = grad_y[current_y, current_x]
-        grad_norm = np.hypot(local_grad_x, local_grad_y)
-        grad_reward = -lam * grad_norm  # Чем выше градиент, тем больше штраф
+
+        # Вектор градиента в текущей точке (направление в сторону роста потенциала)
+        grad_vector = np.array([local_grad_x, local_grad_y])
+
+        # Вектор направления движения робота (основанный на угле ориентации)
+        motion_direction = np.array([np.cos(self.current_yaw), np.sin(self.current_yaw)])
+
+        # Скалярное произведение: положительное → движение в сторону роста потенциала (плохо), отрицательное → движение в сторону спада (хорошо)
+        projection = np.dot(motion_direction, grad_vector)
+
+        # Награждаем движение против градиента (к цели), штрафуем за движение по градиенту (к препятствию)
+        grad_reward = lam * (-projection)  # Чем больше projection, тем больше штраф, чем меньше — тем больше награда
+
 
         # Отталкивающее поле (штраф за близость к препятствию)
         if obstacle_detected and min_obstacle_dist > 0:
