@@ -1,39 +1,36 @@
 import tensorflow as tf
-from tensorflow.keras import layers
+# from tensorflow import kears
+from keras import layers
 import numpy as np
 import matplotlib.pyplot as plt
 
-
-
 def world_to_map(world_coords, resolution, origin, map_offset, map_shape):
-    """
-    Преобразует мировые координаты в пиксельные, учитывая смещение
-    и возможный переворот карты SLAM.
-
-    Параметры:
-      world_coords: (x_world, y_world) – мировые координаты
-      resolution: масштаб (размер одного пикселя в мировых единицах)
-      origin: мировые координаты начала карты (нижний левый угол SLAM)
-      map_offset: (offset_x, offset_y) – сдвиг, чтобы центрировать карту
-      map_shape: (map_height, map_width) – размеры карты в пикселях
-    
-    Возвращает:
-      (x_map, y_map): координаты в пиксельной системе
-    """
     x_world, y_world = world_coords
+    if isinstance(x_world, tf.Tensor):
+        x_world = x_world.numpy()
+    if isinstance(y_world, tf.Tensor):
+        y_world = y_world.numpy()
 
-    # Перевод в пиксельные координаты
-    x_map = int((x_world - origin[0]) / resolution) + map_offset[0]
-    y_map = int((y_world - origin[1]) / resolution) + map_offset[1]
+    # Проверка на NaN и Inf
+    if isinstance(x_world, np.ndarray):
+        mask = np.isfinite(x_world) & np.isfinite(y_world)
+        x_world, y_world = x_world[mask], y_world[mask]
 
-    # Переворачиваем Y, если SLAM-карта инвертирована
+    elif not np.isfinite(x_world) or not np.isfinite(y_world):
+        return None, None  # Вернем None, если координаты некорректны
+
+    # Преобразование
+    x_map = ((x_world - origin[0]) / resolution).astype(int) + map_offset[0]
+    y_map = ((y_world - origin[1]) / resolution).astype(int) + map_offset[1]
+
+    # Переворот Y
     y_map = map_shape[0] - y_map - 1
 
-    # Ограничиваем координаты
-    x_map = max(0, min(x_map, map_shape[1] - 1))
-    y_map = max(0, min(y_map, map_shape[0] - 1))
+    # Ограничение координат
+    x_map = np.clip(x_map, 0, map_shape[1] - 1)
+    y_map = np.clip(y_map, 0, map_shape[0] - 1)
 
-    return (x_map, y_map)
+    return x_map, y_map
 
 # -------------------------------
 # Определение блока ResBlock
@@ -89,14 +86,20 @@ class ImprovedCritic(tf.keras.Model):
         self.grid_map = grid_map
         self.optimal_path = optimal_path
         # self.value_map = None
+        self.dev_mean = 1.0
+        self.dev_std = 1.0
+        self.deviation_list = []
+        self.penality_list = []
+        # self.history = []
+        # self.max_history = 1000
 
         # На вход подаем состояние плюс один дополнительный признак (отклонение + штраф)
-        self.rb1 = ResBlock(state_dim-2, state_dim-2, n_neurons)
-        self.rb2 = ResBlock((state_dim-2) * 2, (state_dim-2) * 2, n_neurons)
+        self.rb1 = ResBlock(state_dim + 1, state_dim+ 1, n_neurons)
+        self.rb2 = ResBlock((state_dim+ 1) * 2, (state_dim+ 1) * 2, n_neurons)
         self.dropout = layers.Dropout(rate=0.1)
         self.out = layers.Dense(1, activation=None, kernel_initializer='he_uniform')
 
-    def call(self, obs, training=True):
+    def call(self, obs, deviation_from_path, collision_penalty, training=True):
         """
         :param obs: вектор состояния, например [x, y, ...]
         :param deviation_from_path: отклонение от оптимального пути (скаляр)
@@ -107,150 +110,106 @@ class ImprovedCritic(tf.keras.Model):
         # Приводим входные данные к тензорам, если они заданы как numpy или числа
         if isinstance(obs, np.ndarray):
             obs = tf.convert_to_tensor(obs, dtype=tf.float32)
-        # if isinstance(deviation_from_path, (float, int)):
-        #     deviation_from_path = tf.convert_to_tensor([deviation_from_path], dtype=tf.float32)
-        # if isinstance(collision_penalty, (float, int)):
-        #     collision_penalty = tf.convert_to_tensor([collision_penalty], dtype=tf.float32)
+        if isinstance(deviation_from_path, (float, int)):
+            deviation_from_path = tf.convert_to_tensor([deviation_from_path], dtype=tf.float32)
+        if isinstance(collision_penalty, (float, int)):
+            collision_penalty = tf.convert_to_tensor([collision_penalty], dtype=tf.float32)
 
         # Складываем отклонение и штраф
-        # combined_deviation = - (deviation_from_path + collision_penalty)
-        # combined_deviation = (combined_deviation - self.dev_mean) / (self.dev_std + 1e-8)
+        combined_deviation = - (deviation_from_path + collision_penalty)
+        tf.debugging.assert_all_finite(combined_deviation, "NaN в combined_deviation")
+        combined_deviation = (combined_deviation - self.dev_mean) / (self.dev_std + 1e-8)
 
-        # Если combined_deviation имеет форму (N,), приводим к (N, 1)
-        # if len(combined_deviation.shape) == 1:
-        #     combined_deviation = tf.expand_dims(combined_deviation, axis=-1)
+        #Если combined_deviation имеет форму (N,), приводим к (N, 1)
+        if len(combined_deviation.shape) == 1:
+            combined_deviation = tf.expand_dims(combined_deviation, axis=-1)
 
+        if tf.reduce_any(tf.math.is_nan(combined_deviation)) or tf.reduce_any(tf.math.is_inf(combined_deviation)):
+            tf.print("Обнаружены некорректные значения (NaN или Inf) в combined_deviation:", combined_deviation)
+            return tf.constant([[float(0)]])  # Возвращаем безопасное значение, если обнаружены NaN или Inf
         #Если obs не батчевый (например, имеет форму (state_dim,)), добавляем размерность батча
         if len(obs.shape) == 1:
             obs = tf.expand_dims(obs, axis=0)
 
         # Объединяем состояние с дополнительным признаком
-        # obs_with_deviation = tf.concat([obs, combined_deviation], axis=-1)
+        obs_with_deviation = tf.concat([obs, combined_deviation], axis=-1)
 
         # tf.debugging.check_numerics(obs_with_deviation, "Проверка obs_with_deviation")
 
         # Проверяем на NaN или Inf
-        if tf.reduce_any(tf.math.is_nan(obs)) or tf.reduce_any(tf.math.is_inf(obs)):
-            tf.print("Обнаружены некорректные значения (NaN или Inf) в данных:", obs)
+        if tf.reduce_any(tf.math.is_nan(obs)) or tf.reduce_any(tf.math.is_inf(obs_with_deviation)):
+            tf.print("Обнаружены некорректные значения (NaN или Inf) в данных:", obs_with_deviation)
+            tf.debugging.check_numerics(obs_with_deviation, "NaN в obs_with_deviation")
             return tf.constant([[float(0)]])
         
         # Проход через резидуальные блоки
-        x0 = obs
+        x0 = obs_with_deviation
         x = self.rb1(x0, final_nl=True)
         x = self.rb2(tf.concat([x0, x], axis=-1), final_nl=True)
         x = self.dropout(x, training=training)
         output = self.out(x)
         return output
     
-    def initialize_value_map(self, grid_map):
-        """ Вычисляет value_map после полной инициализации модели. """
-        value_map = np.zeros(grid_map.shape, dtype=np.float32)
-        value_map = self.precompute_value_map(self.grid_map)
-        print('Сетка критика построена!')
-        return value_map
-
-    def precompute_value_map(self, grid_map):
-        """ Заполняем таблицу значений критика для всех точек grid_map """
-        height, width = grid_map.shape
-        value_map = np.zeros((height, width))
-
-        for y in range(height):
-            for x in range(width):
-                state = np.array([x, y], dtype=np.float32)  
-                state = np.reshape(state, (1, -1))  
-                value_map[y, x] = self.call(state).numpy().flatten()[0]  # Получаем оценку критика
-                print(f"({x}, {y}) -> {value_map[y, x]}")
-
-        for path_point in self.optimal_path:
-            x_p, y_p = int(path_point[0]), int(path_point[1])
-            if 0 <= x_p < width and 0 <= y_p < height:
-                value_map[y_p, x_p] += 10.0  # Увеличиваем ценность (можно менять вес)
-
-        value_map = value_map.astype(np.float32)    
-        # print(type(value_map))  # Должно быть <class 'numpy.ndarray'>
-        # print(value_map.dtype)  # Должно быть float32 или float64
-        # print(value_map.shape)  # Должно быть (100, 100)
-
-        # print(np.isnan(value_map).sum(), np.isinf(value_map).sum()) 
-
-        # print(value_map) 
-
-        # value_map = np.array(value_map, dtype=np.float32)
-        # print(value_map.dtype)
-
-        return value_map
-
-    # def eval_value(self, state, grid_map):
-    #     """
-    #     Оценивает значение состояния (работает с первым образцом, если state – батч)
-    #     :param state: вектор состояния или батч состояний
-    #     :return: оценка ценности
-    #     """
+    def eval_value(self, state, grid_map):
+        """
+        Оценивает значение состояния (работает с первым образцом, если state – батч)
+        :param state: вектор состояния или батч состояний
+        :return: оценка ценности
+        """
         
-    #     # print(len(state))
-    #     # Если state является батчем, берём первый элемент
-    #     # if len(state) > 1:
-    #     #     state_sample = state[0]
-    #     # else:
-    #     #     state_sample = state
-
-        
-    #     state_sample = [state[0][0], state[0][1]]
-    #     st = [state[0][2], state[0][3]]
-    #     state_sample = world_to_map(state_sample, resolution = 0.05, origin = (-4.86, -7.36),  map_offset = (45, 15), map_shape = grid_map.shape )
-    #     # Предполагаем, что первые два элемента вектора – координаты (x, y)
-    #     # Приводим их к числам для работы с numpy
-    #     current_pos = (float(state_sample[0].numpy()) if hasattr(state_sample[0], 'numpy') else float(state_sample[0]),
-    #                    float(state_sample[1].numpy()) if hasattr(state_sample[1], 'numpy') else float(state_sample[1]))
-    #     deviation = compute_deviation_from_path(current_pos, self.optimal_path)
-
-    #     # Определяем штраф за столкновение
-    #     collision_penalty = 0
-    #     if self.is_near_obstacle(current_pos):
-    #         collision_penalty = 10 # Значительный штраф за приближение к препятствию
-
-    #     state = tf.concat([
-    #     tf.convert_to_tensor(state_sample, dtype=tf.float32),  # Пиксельные координаты
-    #     tf.convert_to_tensor(st, dtype=tf.float32)             # Доп. параметры
-    #     ], axis=-1)
-
-    #     # print(state)
-    #     return self.call(state, deviation, collision_penalty)
-
-    def eval_value(self, state, grid_map, value_map):
-        """ Извлекаем оценку из предобученной карты значений с учетом направления к цели """
-        
+        # print(len(state))
+        # Если state является батчем, берём первый элемент
         if state.ndim == 2 and state.shape[0] == 1:
-            state = state[0] 
-            
-        state_nt = world_to_map(state[:2], resolution=0.05, origin=(-4.86, -7.36),
-                                map_offset=(45, 15), map_shape=grid_map.shape)
-        x, y = state_nt[0], state_nt[1]
-        value = value_map[y, x]  # Используем предвычисленные оценки
+            state = state[0]
 
-        return value 
+        
+        state_sample = [state[0], state[1]]
+        st = [state[2], state[3]]
+        state_sample = world_to_map(state_sample, resolution = 0.05, origin = (-4.86, -7.36),  map_offset = (45, 15), map_shape = grid_map.shape)
+        
+        # Предполагаем, что первые два элемента вектора – координаты (x, y)
+        # Приводим их к числам для работы с numpy
+        current_pos = (float(state_sample[0].numpy()) if hasattr(state_sample[0], 'numpy') else float(state_sample[0]),
+                       float(state_sample[1].numpy()) if hasattr(state_sample[1], 'numpy') else float(state_sample[1]))
+        deviation = compute_deviation_from_path(current_pos, self.optimal_path)
+        self.deviation_list.append(deviation)
+        # Определяем штраф за столкновение
+        collision_penalty = 0
+        if self.is_near_obstacle(current_pos):
+            assert isinstance(collision_penalty, (int, float))
+            collision_penalty = 10 # Значительный штраф за приближение к препятствию
+        self.penality_list.append(collision_penalty)
+        state = tf.concat([
+        tf.convert_to_tensor(state_sample, dtype=tf.float32),  # Пиксельные координаты
+        tf.convert_to_tensor(st, dtype=tf.float32)             # Доп. параметры
+        ], axis=-1)
 
-    # def is_near_obstacle(self, point, safe_distance=2):
-    #     """
-    #     Проверяет, находится ли точка рядом с препятствием на карте.
-    #     :param point: координаты точки (x, y)
-    #     :param safe_distance: радиус проверки вокруг точки
-    #     :return: True, если в области обнаружено препятствие
-    #     """
-    #     x, y = int(round(point[0])), int(round(point[1]))
-    #     h, w = self.grid_map.shape
+        # print(state)
+        return self.call(state, deviation, collision_penalty)
 
-    #     if x < 0 or y < 0 or x >= w or y >= h:
-    #         return True
+    
+    def is_near_obstacle(self, point, safe_distance=2):
+        """
+        Проверяет, находится ли точка рядом с препятствием на карте.
+        :param point: координаты точки (x, y)
+        :param safe_distance: радиус проверки вокруг точки
+        :return: True, если в области обнаружено препятствие
+        """
+        x, y = int(round(point[0])), int(round(point[1]))
+        h, w = self.grid_map.shape
 
-    #     # Определяем границы области проверки (учитываем, что срез в numpy не включает правую границу)
-    #     x_min = max(0, x - safe_distance)
-    #     x_max = min(w, x + safe_distance + 1)
-    #     y_min = max(0, y - safe_distance)
-    #     y_max = min(h, y + safe_distance + 1)
+        if x < 0 or y < 0 or x >= w or y >= h:
+            return True
 
-    #     area = self.grid_map[y_min:y_max, x_min:x_max]
-    #     return np.any(area == 1)
+        # Определяем границы области проверки (учитываем, что срез в numpy не включает правую границу)
+        x_min = max(0, x - safe_distance)
+        x_max = min(w, x + safe_distance + 1)
+        y_min = max(0, y - safe_distance)
+        y_max = min(h, y + safe_distance + 1)
+
+        area = self.grid_map[y_min:y_max, x_min:x_max]
+        return np.any(area == 1)
+
 
 class StaticCritic:
     def __init__(self, value_map, grid_map):
@@ -259,6 +218,8 @@ class StaticCritic:
 
     def call(self, state):
         """ Получаем значение критика из предвычисленной карты """
+        if isinstance(state, tf.Tensor):
+            state = state.numpy()
         if state.ndim == 2 and state.shape[0] == 1:
             state = state[0] 
         x, y = state[:2]  # Берём координаты состояния

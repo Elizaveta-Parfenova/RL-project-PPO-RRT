@@ -111,15 +111,43 @@ class RRTStar:
                 near_nodes.append(node)
         return near_nodes
 
-    # ------------------------------
-    # Выбор наилучшего родителя для new_node из списка near_nodes
-    # ------------------------------
+    def find_safest_path(self, paths):
+        """
+        Выбирает путь, который находится дальше от препятствий.
+        :param paths: список возможных путей (списков точек)
+        :return: путь с наименьшим штрафом
+        """
+        best_path = None
+        best_score = float('inf')
+
+        for path in paths:
+            total_penalty = sum(self.compute_obstacle_cost(point) for point in path)
+            avg_penalty = total_penalty / len(path)  # Средний штраф за путь
+
+            if avg_penalty < best_score:
+                best_score = avg_penalty
+                best_path = path
+
+        return best_path
+
+    def compute_obstacle_cost(self, point, min_distance=3):
+        x, y = point
+        if self.grid_map[y, x] == 1:
+            return float('inf')  # Прямо в препятствии - бесконечная стоимость
+        # Оценим расстояние до ближайшего препятствия
+        local_area = self.grid_map[max(0, y - min_distance): min(self.grid_map.shape[0], y + min_distance),
+                                max(0, x - min_distance): min(self.grid_map.shape[1], x + min_distance)]
+        penalty = np.sum(local_area)  # Чем больше препятствий рядом, тем выше штраф
+        return penalty * 5  # Коэффициент штрафа
+
     def choose_parent(self, new_node, near_nodes):
         best_cost = float('inf')
         best_parent = None
         for near_node in near_nodes:
             if not self.is_line_collision(near_node.point, new_node.point):
-                cost = near_node.cost + np.linalg.norm(np.array(near_node.point) - np.array(new_node.point))
+                cost = (near_node.cost +
+                        np.linalg.norm(np.array(near_node.point) - np.array(new_node.point)) +
+                        self.compute_obstacle_cost(new_node.point))
                 if cost < best_cost:
                     best_cost = cost
                     best_parent = near_node
@@ -144,37 +172,41 @@ class RRTStar:
     # Основной метод планирования пути
     # ------------------------------
     def plan(self):
+        best_paths = []  # Храним все возможные пути
+
         for i in range(self.max_iter):
             random_point = self.get_random_point()
             nearest_node = self.nearest(random_point)
             new_point = self.steer(nearest_node.point, random_point)
-            
-            # Если новая точка попадает в препятствие или соединение от nearest_node до new_point имеет коллизию — пропускаем итерацию
+
             if self.is_collision(new_point) or self.is_line_collision(nearest_node.point, new_point):
                 continue
-            
+
             new_node = Node(new_point)
             new_node.cost = nearest_node.cost + np.linalg.norm(np.array(nearest_node.point) - np.array(new_point))
             new_node.parent = nearest_node
 
-            # Найти все узлы в окрестности и выбрать наилучшего родителя
             near_nodes = self.get_near_nodes(new_node)
             self.choose_parent(new_node, near_nodes)
             self.node_list.append(new_node)
 
-            # Ревайринг: попытаться улучшить путь для узлов в окрестности через new_node
             self.rewire(new_node, near_nodes)
 
-            # Если новый узел достаточно близок к цели, проверяем соединение с целью
             if np.linalg.norm(np.array(new_node.point) - np.array(self.goal.point)) < self.step_size:
                 if not self.is_line_collision(new_node.point, self.goal.point):
                     self.goal.parent = new_node
                     self.goal.cost = new_node.cost + np.linalg.norm(np.array(new_node.point) - np.array(self.goal.point))
                     self.node_list.append(self.goal)
-                    return self.extract_path()
-        # Если за заданное число итераций путь не найден, возвращаем None
-        return None
 
+                    # Сохраняем путь
+                    best_paths.append(self.extract_path())
+
+        if not best_paths:
+            return None  # Не найдено ни одного пути
+
+        # Выбираем безопасный путь
+        return self.find_safest_path(best_paths)
+    
     # ------------------------------
     # Извлечение пути от цели до старта
     # ------------------------------
@@ -182,57 +214,9 @@ class RRTStar:
         path = []
         node = self.goal
         while node is not None:
-            path.append(node.point)
+            if node.point != self.start.point:  # Исключаем стартовую точку
+                path.append(node.point)
             node = node.parent
         path.reverse()
         return path
 
-# # ------------------------------
-# # Пример использования
-# # ------------------------------
-# if __name__ == "__main__":
-#     # Загрузим карту (например, как grayscale-изображение)
-#     slam_map = cv2.imread('map.pgm', cv2.IMREAD_GRAYSCALE)
-    
-#     # Преобразуем SLAM-карту в бинарную grid_map:
-#     # Например, если препятствия – белые (значения близкие к 255), а свободное пространство – тёмное:
-#     threshold = 120
-#     # Здесь 1 – препятствие, 0 – свободно.
-#     grid_map = np.where(slam_map < threshold, 0, 1)
-
-#     # Задаём стартовую и целевую точки (в координатах пикселей)
-#     start = (10, 10)    # (x, y)
-#     goal = (grid_map.shape[1] - 10, grid_map.shape[0] - 10)
-
-#     # Создаем экземпляр алгоритма RRT*
-#     rrt_star = RRTStar(start, goal, grid_map, max_iter=2000, step_size=10, goal_sample_rate=0.1)
-
-#     path = rrt_star.plan()
-
-#     if path is None:
-#         print("Путь не найден")
-#     else:
-#         print("Найденный путь:")
-#         print(path)
-        
-#         # Визуализация результатов:
-#         plt.figure(figsize=(8, 8))
-#         plt.imshow(grid_map, cmap='gray')
-        
-#         # Отрисовываем все узлы дерева
-#         for node in rrt_star.node_list:
-#             if node.parent is not None:
-#                 p1 = node.point
-#                 p2 = node.parent.point
-#                 plt.plot([p1[0], p2[0]], [p1[1], p2[1]], "-g")
-                
-#         # Отрисовываем найденный путь
-#         path_x = [p[0] for p in path]
-#         path_y = [p[1] for p in path]
-#         plt.plot(path_x, path_y, "-r", linewidth=2)
-        
-#         plt.scatter(start[0], start[1], color="blue", s=100, label="Старт")
-#         plt.scatter(goal[0], goal[1], color="magenta", s=100, label="Цель")
-#         plt.legend()
-#         plt.title("RRT*")
-#         plt.show()
