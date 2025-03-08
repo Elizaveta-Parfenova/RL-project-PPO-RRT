@@ -129,8 +129,8 @@ class PPOAgent:
             logger.info(f'Fututre_state for {action}: {future_state}') 
 
             # Оценки от обучаемого критика
-            value_now_learned = self.critic.eval_value(next_state, self.grid_map)
-            value_future_learned = self.critic.eval_value(future_state, self.grid_map)
+            value_now_learned = self.critic.call(next_state)
+            value_future_learned = self.critic.call(future_state)
 
             # Оценки от статического критика
             value_now_static = self.critic_st.call(next_state)
@@ -227,22 +227,11 @@ class PPOAgent:
 
         # === Обновление критика ===
         with tf.GradientTape() as tape:
-            values = []
-            for i, state in enumerate(states):
-            # Получаем отклонение и штраф для текущего состояния
-                deviation = self.critic.deviation_list[i]
-                penalty = self.critic.penality_list[i]
-            # Вычисляем оценку критика для текущего состояния
-                value = self.critic.call(state, deviation, penalty)
-                values.append(value)
-            values = tf.stack(values)  # Сохраняем все значения критика за эпизод
-            logger.info(f'Values with critic update:  {values}' )
-            returns = np.array([value.numpy() for value in values])  # Возвращаемое значение от критика
-            self.critic.deviation_list = []
-            self.critic.penality_list = []
-        # Используем Huber loss для вычисления потерь
-            critic_loss = tf.reduce_mean(tf.keras.losses.Huber()(returns, values))
-            logger.info(f'Criitc loss:  {critic_loss}')
+            # Получаем значения из критика
+            values = tf.squeeze(self.critic.call(states))
+            # print(values)
+            # Рассчитываем потерю критика
+            critic_loss = tf.keras.losses.Huber()(returns, values)
 
         # print(self.critic.trainable_variables)
         critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
@@ -276,7 +265,7 @@ class PPOAgent:
                 
                 next_state = np.reshape(next_state, [1, self.state_dim])
 
-                value_learned = self.critic.eval_value(state, self.grid_map)[0, 0]
+                value_learned = self.critic.call(state)[0, 0]
                 value_static = self.critic_st.call(state)  # StaticCritic
                 
                 logger.info(f'Value learned:  {value_learned}')
@@ -297,7 +286,7 @@ class PPOAgent:
             epsilon = max(epsilon_min, epsilon * epsilon_decay)
 
             # Последнее значение критика
-            next_value_learned = self.critic.eval_value(next_state, self.grid_map)[0, 0]
+            next_value_learned = self.critic.call(next_state)[0, 0]
             next_value_static = self.critic_st.call(next_state)
 
             values_learned.append(next_value_learned)

@@ -125,8 +125,16 @@ def path(state, goal, grid_map, map_resolution = 0.05, map_origin = (-4.86, -7.3
         plt.show()
     return optimal_path
 
+# -------------------------------
+# Функция для расчёта отклонения от оптимального пути
+# -------------------------------
+def compute_deviation_from_path(current_pos, optimal_path):
+    path_points = np.array(optimal_path)
+    distances = np.linalg.norm(path_points - np.array(current_pos), axis=1)
+    min_distance = np.min(distances)
+    return min_distance
 
-def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=50.0, d0=5.0, scale = 0.1):
+def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=50.0, d0=8.0, scale = 0.07):
     """
     Улучшенная генерация потенциального поля:
     - Притягивающий потенциал (quadratic)
@@ -253,7 +261,7 @@ class TurtleBotEnv(Node, gym.Env):
         # Получаем значение поля
         if 0 <= current_x < self.grid_map.shape[1] and 0 <= current_y < self.grid_map.shape[0]:
             potential_value = self.potential_field[current_y, current_x]
-            print(f'Potential value: {potential_value}')
+            # print(f'Potential value: {potential_value}')
             logger.info(f'Potential value: {potential_value}') 
         else:
             potential_value = 1
@@ -359,7 +367,7 @@ class TurtleBotEnv(Node, gym.Env):
         # min_obstacle_dist остаётся прежним (или можно пересчитывать)
         return np.array([next_x, next_y, next_angle, min_obstacle_dist], dtype=np.float32)
 
-    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=0.8, k_rep=10.0, d0=10.0, lam=0.5):
+    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=5.0, k_rep=50.0, d0=8.0, lam=0.5):
         current_x, current_y, _, min_obstacle_dist = state
 
         # Преобразуем координаты в пиксельные
@@ -439,6 +447,37 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_x, self.prev_y = current_x, current_y
 
         return total_reward
+    
+    def compute_deviation_from_path(self, current_pos):
+        """
+        Вычисляет минимальное расстояние от текущей позиции агента до оптимального пути.
+        :param current_pos: (x, y) текущая позиция агента.
+        :param optimal_path: список точек пути [(x1, y1), (x2, y2), ...]
+        :return: минимальное расстояние до пути (скаляр).
+        """
+        path_points = np.array(self.optimal_path)
+        distances = np.linalg.norm(path_points - np.array(current_pos), axis=1)
+        min_distance = np.min(distances)
+        return min_distance
+
+    def get_deviation_penalty(self, current_pos, max_penalty=10):
+        """
+        Рассчитывает штраф за отклонение от пути.
+        :param current_pos: (x, y) текущая позиция агента.
+        :param optimal_path: список точек пути [(x1, y1), (x2, y2), ...].
+        :param max_penalty: максимальный штраф за сильное отклонение.
+        :return: штраф (скаляр, отрицательный).
+        """
+        if current_pos.ndim == 2 and current_pos.shape[0] == 1:
+            current_pos = current_pos[0]
+
+        state = world_to_map(current_pos, resolution = 0.05, origin = (-4.86, -7.36),  map_offset = (45, 15), map_shape = self.grid_map.shape)
+        
+        deviation = self.compute_deviation_from_path(state)
+        
+        # Можно сделать штраф линейным или экспоненциальным в зависимости от задачи
+        penalty = -min(max_penalty, deviation)  # Чем дальше от пути, тем больше штраф
+        return penalty
 
     def step(self, action):
         cmd_msg = Twist()
@@ -466,7 +505,10 @@ class TurtleBotEnv(Node, gym.Env):
 
         # distance_rate = (self.past_distance - distance)
         # print(min_obstacle_dist)
-        reward = self.compute_potential_reward(state, self.goal, self.optimal_path, obstacle_detected)
+        reward_potent_val = self.compute_potential_reward(state, self.goal, self.optimal_path, obstacle_detected)
+        reward_optimal_path = self.get_deviation_penalty(state[:2])
+
+        reward = reward_potent_val + reward_optimal_path
         # reward += 50.0 * distance_rate
         # self.past_distance = distance
 

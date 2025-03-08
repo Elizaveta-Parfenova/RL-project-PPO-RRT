@@ -62,14 +62,6 @@ class ResBlock(tf.keras.Model):
             x = self.activation(x)
         return x
 
-# -------------------------------
-# Функция для расчёта отклонения от оптимального пути
-# -------------------------------
-def compute_deviation_from_path(current_pos, optimal_path):
-    path_points = np.array(optimal_path)
-    distances = np.linalg.norm(path_points - np.array(current_pos), axis=1)
-    min_distance = np.min(distances)
-    return min_distance
 
 # -------------------------------
 # Определение улучшенного критика
@@ -86,20 +78,20 @@ class ImprovedCritic(tf.keras.Model):
         self.grid_map = grid_map
         self.optimal_path = optimal_path
         # self.value_map = None
-        self.dev_mean = 1.0
-        self.dev_std = 1.0
-        self.deviation_list = []
-        self.penality_list = []
+        # self.dev_mean = 1.0
+        # self.dev_std = 1.0
+        # self.deviation_list = []
+        # self.penality_list = []
         # self.history = []
         # self.max_history = 1000
 
         # На вход подаем состояние плюс один дополнительный признак (отклонение + штраф)
-        self.rb1 = ResBlock(state_dim + 1, state_dim+ 1, n_neurons)
-        self.rb2 = ResBlock((state_dim+ 1) * 2, (state_dim+ 1) * 2, n_neurons)
+        self.rb1 = ResBlock(state_dim , state_dim, n_neurons)
+        self.rb2 = ResBlock((state_dim) * 2, (state_dim) * 2, n_neurons)
         self.dropout = layers.Dropout(rate=0.1)
         self.out = layers.Dense(1, activation=None, kernel_initializer='he_uniform')
 
-    def call(self, obs, deviation_from_path, collision_penalty, training=True):
+    def call(self, obs, training=True):
         """
         :param obs: вектор состояния, например [x, y, ...]
         :param deviation_from_path: отклонение от оптимального пути (скаляр)
@@ -110,105 +102,83 @@ class ImprovedCritic(tf.keras.Model):
         # Приводим входные данные к тензорам, если они заданы как numpy или числа
         if isinstance(obs, np.ndarray):
             obs = tf.convert_to_tensor(obs, dtype=tf.float32)
-        if isinstance(deviation_from_path, (float, int)):
-            deviation_from_path = tf.convert_to_tensor([deviation_from_path], dtype=tf.float32)
-        if isinstance(collision_penalty, (float, int)):
-            collision_penalty = tf.convert_to_tensor([collision_penalty], dtype=tf.float32)
 
-        # Складываем отклонение и штраф
-        combined_deviation = - (deviation_from_path + collision_penalty)
-        tf.debugging.assert_all_finite(combined_deviation, "NaN в combined_deviation")
-        combined_deviation = (combined_deviation - self.dev_mean) / (self.dev_std + 1e-8)
-
-        #Если combined_deviation имеет форму (N,), приводим к (N, 1)
-        if len(combined_deviation.shape) == 1:
-            combined_deviation = tf.expand_dims(combined_deviation, axis=-1)
-
-        if tf.reduce_any(tf.math.is_nan(combined_deviation)) or tf.reduce_any(tf.math.is_inf(combined_deviation)):
-            tf.print("Обнаружены некорректные значения (NaN или Inf) в combined_deviation:", combined_deviation)
+        if tf.reduce_any(tf.math.is_nan(obs)) or tf.reduce_any(tf.math.is_inf(obs)):
+            tf.print("Обнаружены некорректные значения (NaN или Inf) в combined_deviation:", obs)
+            tf.debugging.check_numerics(obs, "Проверка obs_with_deviation")
             return tf.constant([[float(0)]])  # Возвращаем безопасное значение, если обнаружены NaN или Inf
+        
         #Если obs не батчевый (например, имеет форму (state_dim,)), добавляем размерность батча
         if len(obs.shape) == 1:
             obs = tf.expand_dims(obs, axis=0)
 
-        # Объединяем состояние с дополнительным признаком
-        obs_with_deviation = tf.concat([obs, combined_deviation], axis=-1)
-
-        # tf.debugging.check_numerics(obs_with_deviation, "Проверка obs_with_deviation")
-
-        # Проверяем на NaN или Inf
-        if tf.reduce_any(tf.math.is_nan(obs)) or tf.reduce_any(tf.math.is_inf(obs_with_deviation)):
-            tf.print("Обнаружены некорректные значения (NaN или Inf) в данных:", obs_with_deviation)
-            tf.debugging.check_numerics(obs_with_deviation, "NaN в obs_with_deviation")
-            return tf.constant([[float(0)]])
-        
         # Проход через резидуальные блоки
-        x0 = obs_with_deviation
+        x0 = obs
         x = self.rb1(x0, final_nl=True)
         x = self.rb2(tf.concat([x0, x], axis=-1), final_nl=True)
         x = self.dropout(x, training=training)
         output = self.out(x)
         return output
     
-    def eval_value(self, state, grid_map):
-        """
-        Оценивает значение состояния (работает с первым образцом, если state – батч)
-        :param state: вектор состояния или батч состояний
-        :return: оценка ценности
-        """
+    # def eval_value(self, state, grid_map):
+    #     """
+    #     Оценивает значение состояния (работает с первым образцом, если state – батч)
+    #     :param state: вектор состояния или батч состояний
+    #     :return: оценка ценности
+    #     """
         
-        # print(len(state))
-        # Если state является батчем, берём первый элемент
-        if state.ndim == 2 and state.shape[0] == 1:
-            state = state[0]
+    #     # print(len(state))
+    #     # Если state является батчем, берём первый элемент
+    #     if state.ndim == 2 and state.shape[0] == 1:
+    #         state = state[0]
 
         
-        state_sample = [state[0], state[1]]
-        st = [state[2], state[3]]
-        state_sample = world_to_map(state_sample, resolution = 0.05, origin = (-4.86, -7.36),  map_offset = (45, 15), map_shape = grid_map.shape)
+    #     state_sample = [state[0], state[1]]
+    #     st = [state[2], state[3]]
+    #     state_sample = world_to_map(state_sample, resolution = 0.05, origin = (-4.86, -7.36),  map_offset = (45, 15), map_shape = grid_map.shape)
         
-        # Предполагаем, что первые два элемента вектора – координаты (x, y)
-        # Приводим их к числам для работы с numpy
-        current_pos = (float(state_sample[0].numpy()) if hasattr(state_sample[0], 'numpy') else float(state_sample[0]),
-                       float(state_sample[1].numpy()) if hasattr(state_sample[1], 'numpy') else float(state_sample[1]))
-        deviation = compute_deviation_from_path(current_pos, self.optimal_path)
-        self.deviation_list.append(deviation)
-        # Определяем штраф за столкновение
-        collision_penalty = 0
-        if self.is_near_obstacle(current_pos):
-            assert isinstance(collision_penalty, (int, float))
-            collision_penalty = 10 # Значительный штраф за приближение к препятствию
-        self.penality_list.append(collision_penalty)
-        state = tf.concat([
-        tf.convert_to_tensor(state_sample, dtype=tf.float32),  # Пиксельные координаты
-        tf.convert_to_tensor(st, dtype=tf.float32)             # Доп. параметры
-        ], axis=-1)
+    #     # Предполагаем, что первые два элемента вектора – координаты (x, y)
+    #     # Приводим их к числам для работы с numpy
+    #     current_pos = (float(state_sample[0].numpy()) if hasattr(state_sample[0], 'numpy') else float(state_sample[0]),
+    #                    float(state_sample[1].numpy()) if hasattr(state_sample[1], 'numpy') else float(state_sample[1]))
+    #     deviation = compute_deviation_from_path(current_pos, self.optimal_path)
+    #     self.deviation_list.append(deviation)
+    #     # Определяем штраф за столкновение
+    #     collision_penalty = 0
+    #     if self.is_near_obstacle(current_pos):
+    #         assert isinstance(collision_penalty, (int, float))
+    #         collision_penalty = 10 # Значительный штраф за приближение к препятствию
+    #     self.penality_list.append(collision_penalty)
+    #     state = tf.concat([
+    #     tf.convert_to_tensor(state_sample, dtype=tf.float32),  # Пиксельные координаты
+    #     tf.convert_to_tensor(st, dtype=tf.float32)             # Доп. параметры
+    #     ], axis=-1)
 
-        # print(state)
-        return self.call(state, deviation, collision_penalty)
+    #     # print(state)
+    #     return self.call(state, deviation, collision_penalty)
 
     
-    def is_near_obstacle(self, point, safe_distance=2):
-        """
-        Проверяет, находится ли точка рядом с препятствием на карте.
-        :param point: координаты точки (x, y)
-        :param safe_distance: радиус проверки вокруг точки
-        :return: True, если в области обнаружено препятствие
-        """
-        x, y = int(round(point[0])), int(round(point[1]))
-        h, w = self.grid_map.shape
+    # def is_near_obstacle(self, point, safe_distance=2):
+    #     """
+    #     Проверяет, находится ли точка рядом с препятствием на карте.
+    #     :param point: координаты точки (x, y)
+    #     :param safe_distance: радиус проверки вокруг точки
+    #     :return: True, если в области обнаружено препятствие
+    #     """
+    #     x, y = int(round(point[0])), int(round(point[1]))
+    #     h, w = self.grid_map.shape
 
-        if x < 0 or y < 0 or x >= w or y >= h:
-            return True
+    #     if x < 0 or y < 0 or x >= w or y >= h:
+    #         return True
 
-        # Определяем границы области проверки (учитываем, что срез в numpy не включает правую границу)
-        x_min = max(0, x - safe_distance)
-        x_max = min(w, x + safe_distance + 1)
-        y_min = max(0, y - safe_distance)
-        y_max = min(h, y + safe_distance + 1)
+    #     # Определяем границы области проверки (учитываем, что срез в numpy не включает правую границу)
+    #     x_min = max(0, x - safe_distance)
+    #     x_max = min(w, x + safe_distance + 1)
+    #     y_min = max(0, y - safe_distance)
+    #     y_max = min(h, y + safe_distance + 1)
 
-        area = self.grid_map[y_min:y_max, x_min:x_max]
-        return np.any(area == 1)
+    #     area = self.grid_map[y_min:y_max, x_min:x_max]
+    #     return np.any(area == 1)
 
 
 class StaticCritic:
