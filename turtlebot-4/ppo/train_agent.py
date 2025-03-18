@@ -17,7 +17,7 @@ import logging
 logging.basicConfig(filename='training_logs.txt', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def precompute_value_map(grid_map, optimal_path, goal, path_weight=5.0, obstacle_weight=10.0, goal_weight = 3.0):
+def precompute_value_map(grid_map, optimal_path, goal, path_weight = 5.0, obstacle_weight=50.0, goal_weight = 4.0):
         """ Заполняем таблицу значений критика для всех точек grid_map """
         height, width = grid_map.shape
         value_map = np.zeros((height, width))
@@ -44,7 +44,7 @@ def precompute_value_map(grid_map, optimal_path, goal, path_weight=5.0, obstacle
         # goal_distances = np.clip(goal_distances, 0, 5)
 
         # Создаём градиентное поле
-        value_map = -path_distances * path_weight + obstacle_distances * (obstacle_weight / (obstacle_distances + 1)) - goal_distances * goal_weight
+        value_map = -path_distances * path_weight - obstacle_distances * (obstacle_weight / (obstacle_distances + 1)) - goal_distances * goal_weight
 
         return value_map
 
@@ -75,8 +75,8 @@ class PPOAgent:
         # print(self.obstacles)
 
         # Коэффициенты
-        self.gamma = 0.99  # коэффициент дисконтирования
-        self.epsilon = 0.2  # параметр клиппинга
+        self.gamma = 0.995  # коэффициент дисконтирования
+        self.epsilon = 0.15 # параметр клиппинга
         self.actor_lr = 0.0003
         self.critic_lr = 0.0003
         self.gaelam = 0.95
@@ -110,7 +110,6 @@ class PPOAgent:
         alpha = np.float32(alpha)
         return alpha
     
-    # Выбор действия и его вероятность
     def get_action(self, state, value_map, alpha, epsilon):
         state = np.reshape(state, [1, self.state_dim])
         logger.info(f'State in get_action: {state}') 
@@ -120,84 +119,74 @@ class PPOAgent:
 
         action_values = np.zeros(self.action_dim)
 
-        # Процесс вычисления значений для каждого действия
         for action in range(self.action_dim):
             next_state = self.env.get_next_state(state, action, self.env.current_yaw)
-            logger.info(f'Next_state for {action}: {next_state}') 
-            angle = next_state[2]
-            future_state = self.env.get_next_state(next_state, action, angle)  # Предсказание на два шага вперёд
-            logger.info(f'Fututre_state for {action}: {future_state}') 
 
-            # Оценки от обучаемого критика
-            value_now_learned = self.critic.call(next_state)
-            value_future_learned = self.critic.call(future_state)
+            # Оценка текущего состояния
+            value_current_learned = self.critic.call(state)
+            value_current_static = self.critic_st.call(state)
 
-            # Оценки от статического критика
-            value_now_static = self.critic_st.call(next_state)
-            value_future_static = self.critic_st.call(future_state)
+            # Оценка будущего состояния
+            value_next_learned = self.critic.call(next_state)
+            value_next_static = self.critic_st.call(next_state)
 
             # Взвешенное объединение критиков
-            value_now = alpha * value_now_learned + (1 - alpha) * value_now_static
-            value_future = alpha * value_future_learned + (1 - alpha) * value_future_static
+            value_current = alpha * value_current_learned + (1 - alpha) * value_current_static
+            value_next = alpha * value_next_learned + (1 - alpha) * value_next_static
 
-            action_values[action] = value_now + 0.3 * value_future  # Учитываем будущее
-
-        logger.info(f'Action values in get_action before normalization: {action_values}') 
+            # Усреднение текущей и будущей оценки
+            action_values[action] = 0.3 * value_current + 0.7 * value_next
+            logger.info(f'Action values in get_action before normalization: {action_values}') 
 
         # Нормализация оценок критика
         action_values = (action_values - np.min(action_values)) / (np.max(action_values) - np.min(action_values) + 1e-10)
-        logger.info(f'Action values in get_action after normalization: {action_values}') 
+        logger.info(f'Action values in get_action after normalization: {action_values}')  
 
-        # С вероятностью epsilon выбираем случайное действие (exploration)
-        # if np.random.rand() < epsilon:
-        #     action = np.random.choice(self.action_dim)  # Случайный выбор действия
-        #     logger.info(f'Selected random action: {action}')
-        # else:
-        # Комбинация вероятностей и оценок критика для выбора наилучшего действия
         combined_scores = alpha * prob + (1 - alpha) * action_values
         logger.info(f'Combined scores in get_action: {combined_scores}') 
-        action = np.argmax(combined_scores)  # Выбираем наилучшее действие
+
+            # Эпсилон-жадный выбор действия
+        # if np.random.rand() < self.epsilon:
+        #     action = np.random.choice(self.action_dim)
+        # else:
+        #     action = np.argmax(combined_scores)
+        action = np.argmax(combined_scores)
 
         return action, prob
-
-
     # Вычисление преимущесвт и возврата
-    def compute_advantages(self, rewards, values_learned, values_static, dones, alpha):
+    def compute_advantages(self, rewards, values, dones):
+        # print('Rewrds: ', rewards)
+        # print('Values:', values) angle_diff
+        # print('Next values:', next_value)
         advantages = np.zeros_like(rewards)
         returns = np.zeros_like(rewards)
         last_gae = 0
-        next_value = values_learned[-1]  # Используем последний элемент из values_learned для next_value
-
+        next_value = values[-1]
         for t in reversed(range(len(rewards))):
-            # Определение next_value и next_done
+            # Обработка последнего шага
             if t == len(rewards) - 1:
-                next_value_learned = values_learned[-1]
-                next_value_static = values_static[-1]
-                next_done = dones[t]
+                next_value = values[-1]
+                next_done = dones[t]  
             else:
-                next_value_learned = values_learned[t + 1]
-                next_value_static = values_static[t + 1]
+                # Обработка остальных шагов
+                next_value = values[t + 1]
                 next_done = dones[t + 1]
 
-            # Комбинируем предсказания критиков в одну переменную
-            next_value_combined = alpha * next_value_learned + (1 - alpha) * next_value_static
-            value_combined = alpha * values_learned[t] + (1 - alpha) * values_static[t]
-
-            # Вычисляем дельту с учетом комбинированного критика
-            delta = rewards[t] + self.gamma * next_value_combined * (1 - next_done) - value_combined
+            # Вычисление ошибки предсказания
+            delta = rewards[t] + self.gamma * next_value * (1 - next_done) - values[t]
+            # if np.isnan(delta):
+            #     print(f"NaN in delta: rewards[{t}]={rewards[t]}, next_value={next_value}, values[{t}]={values[t]}")
             advantages[t] = last_gae = delta + self.gamma * self.gaelam * (1 - next_done) * last_gae
-
-        # Нормализация advantages
+        # print('Advanteges:', advantages)
+    # Возвраты для обновления критика
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
-
-        # Возвращаемые значения
-        returns = advantages + values_learned[:-1]  # Используем `values_learned[:-1]`, чтобы размер соответствовал advantages
+        returns = advantages + values[:-1]  
+        # print ('Returns:', returns)
         logger.info(f'Returns:  {returns}' )
         logger.info(f'Advanteges:  {advantages}' )
-        logger.info(f'Values_learned: {value_combined}')
+        logger.info(f'Values_learned: {values}')
 
-
-        return advantages, returns
+        return advantages, returns 
     
     # Обновление политик
     def update(self, states, actions, advantages, returns, old_probs):
@@ -238,7 +227,7 @@ class PPOAgent:
         self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
 
 
-    def train(self, max_episodes=10, batch_size=32):
+    def train(self, max_episodes=100, batch_size=32):
         all_rewards = []
         alpha = 0
         epsilon_min = 0.01
@@ -297,7 +286,7 @@ class PPOAgent:
 
             # Вычисляем `advantages` и `returns`
             # print(alpha)
-            advantages, returns = self.compute_advantages(rewards, values_learned, values_static, dones, alpha)
+            advantages, returns = self.compute_advantages(rewards, values_learned, dones)
 
             # Обновляем модель
             self.update(np.vstack(states), actions, advantages, returns, probs)

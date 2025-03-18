@@ -2,6 +2,7 @@ import numpy as np
 import random
 import math
 import matplotlib.pyplot as plt
+from skimage.draw import line
 
 # ------------------------------
 # Определение узла (Node)
@@ -82,22 +83,11 @@ class RRTStar:
     # Проверка столкновения вдоль линии между p1 и p2
     # ------------------------------
     def is_line_collision(self, p1, p2):
-        """
-        Дискретизирует отрезок между p1 и p2 и проверяет каждую точку.
-        Можно заменить алгоритмом Брезенхэма для повышения точности.
-        """
         x1, y1 = p1
         x2, y2 = p2
-        distance = math.hypot(x2 - x1, y2 - y1)
-        if distance == 0:
-            return False
-        steps = int(distance)
-        for i in range(steps + 1):
-            t = i / float(steps)
-            x = int(round(x1 + t * (x2 - x1)))
-            y = int(round(y1 + t * (y2 - y1)))
+        rr, cc = line(y1, x1, y2, x2)  # Получаем координаты линии (y, x)
+        for y, x in zip(rr, cc):
             if self.is_collision((x, y)):
-                print(f"Collision detected at ({x}, {y})")  # Отладочный вывод
                 return True
         return False
 
@@ -111,46 +101,49 @@ class RRTStar:
                 near_nodes.append(node)
         return near_nodes
 
-    def find_safest_path(self, paths):
-        """
-        Выбирает путь, который находится дальше от препятствий.
-        :param paths: список возможных путей (списков точек)
-        :return: путь с наименьшим штрафом
-        """
+    def find_safest_path(self, paths, lambda_penalty=0.1, min_distance=3):
         best_path = None
         best_score = float('inf')
 
         for path in paths:
-            total_penalty = sum(self.compute_obstacle_cost(point) for point in path)
-            avg_penalty = total_penalty / len(path)  # Средний штраф за путь
+            total_penalty = sum(self.compute_obstacle_cost(point, min_distance) for point in path)
+            path_length = len(path)  # Длина пути
+            score = total_penalty + lambda_penalty * path_length  # Балансируем штраф и длину пути
 
-            if avg_penalty < best_score:
-                best_score = avg_penalty
+            if score < best_score:
+                best_score = score
                 best_path = path
 
         return best_path
 
-    def compute_obstacle_cost(self, point, min_distance=3):
+    def compute_obstacle_cost(self, point, min_distance=5):
         x, y = point
         if self.grid_map[y, x] == 1:
-            return float('inf')  # Прямо в препятствии - бесконечная стоимость
-        # Оценим расстояние до ближайшего препятствия
+            return float('inf')  # Если точка в препятствии - бесконечный штраф
+        
+        # Оценка окрестности вокруг точки
         local_area = self.grid_map[max(0, y - min_distance): min(self.grid_map.shape[0], y + min_distance),
                                 max(0, x - min_distance): min(self.grid_map.shape[1], x + min_distance)]
         penalty = np.sum(local_area)  # Чем больше препятствий рядом, тем выше штраф
-        return penalty * 5  # Коэффициент штрафа
+        
+        # Увеличиваем штраф за близость к стенам
+        distance_weight = 50 / (1 + np.exp(-penalty / 2))  # Нелинейный штраф
+        
+        return distance_weight
 
     def choose_parent(self, new_node, near_nodes):
         best_cost = float('inf')
         best_parent = None
+
         for near_node in near_nodes:
             if not self.is_line_collision(near_node.point, new_node.point):
-                cost = (near_node.cost +
-                        np.linalg.norm(np.array(near_node.point) - np.array(new_node.point)) +
-                        self.compute_obstacle_cost(new_node.point))
+                cost = (near_node.cost + np.linalg.norm(np.array(near_node.point) - np.array(new_node.point)) +
+                        self.compute_obstacle_cost(new_node.point))  # Добавляем штраф за близость к стенам
+                
                 if cost < best_cost:
                     best_cost = cost
                     best_parent = near_node
+
         if best_parent is not None:
             new_node.parent = best_parent
             new_node.cost = best_cost
@@ -179,6 +172,7 @@ class RRTStar:
             nearest_node = self.nearest(random_point)
             new_point = self.steer(nearest_node.point, random_point)
 
+            # Проверка на столкновения
             if self.is_collision(new_point) or self.is_line_collision(nearest_node.point, new_point):
                 continue
 
@@ -186,12 +180,15 @@ class RRTStar:
             new_node.cost = nearest_node.cost + np.linalg.norm(np.array(nearest_node.point) - np.array(new_point))
             new_node.parent = nearest_node
 
+            # Поиск ближайших соседей и выбор родителя
             near_nodes = self.get_near_nodes(new_node)
             self.choose_parent(new_node, near_nodes)
             self.node_list.append(new_node)
 
+            # Применяем процесс повторной проводки (rewiring)
             self.rewire(new_node, near_nodes)
 
+            # Проверка, если новая вершина близка к цели
             if np.linalg.norm(np.array(new_node.point) - np.array(self.goal.point)) < self.step_size:
                 if not self.is_line_collision(new_node.point, self.goal.point):
                     self.goal.parent = new_node
@@ -201,12 +198,16 @@ class RRTStar:
                     # Сохраняем путь
                     best_paths.append(self.extract_path())
 
-        if not best_paths:
-            return None  # Не найдено ни одного пути
+                    # Если путь найден, сразу возвращаем его
+                    return self.extract_path()
 
-        # Выбираем безопасный путь
+        # Если не найдено ни одного пути
+        if not best_paths:
+            return None
+
+        # Выбираем безопасный путь из лучших
         return self.find_safest_path(best_paths)
-    
+
     # ------------------------------
     # Извлечение пути от цели до старта
     # ------------------------------

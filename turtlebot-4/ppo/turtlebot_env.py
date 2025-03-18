@@ -134,7 +134,7 @@ def compute_deviation_from_path(current_pos, optimal_path):
     min_distance = np.min(distances)
     return min_distance
 
-def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=50.0, d0=8.0, scale = 0.07):
+def generate_potential_field(grid_map, goal, path_points, k_att=10.0, k_rep=30.0, d0=5.0, scale = 0.07):
     """
     Улучшенная генерация потенциального поля:
     - Притягивающий потенциал (quadratic)
@@ -206,6 +206,7 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_potential = 0 
         self.prev_x = None  # Предыдущая координата X
         self.prev_y = None  # Предыдущая координата Y
+        self.obstacle_count = 0  
         
 
         self.current_x = 0.0
@@ -270,11 +271,16 @@ class TurtleBotEnv(Node, gym.Env):
         camera_obstacle_count = sum(self.camera_history)  # Считаем количество True
         camera_obstacle_threshold = 12  
 
+        # Если LiDAR видит препятствие вблизи
+        if min_obstacle_dist < 0.2:
+            # Принудительно увеличиваем потенциал в случае обнаружения препятствия
+            potential_value = max(potential_value, np.percentile(self.potential_field, 90))
+    
         # Логика определения препятствий
         self.lidar_obstacle_detected = (
             (min_obstacle_dist < 0.2) and (  # Лидар обнаружил близкое препятствие И
-                (potential_value > -0.1) or   # Более чувствительный порог
-                (potential_value > np.percentile(self.potential_field, 90)) or  # Высокий потенциал
+                (potential_value > 3) or  # Более чувствительный порог
+                # (potential_value > np.percentile(self.potential_field, 90)) or  # Высокий потенциал
                 (camera_obstacle_count >= camera_obstacle_threshold)  # Камера часто видела препятствие
             )
         )
@@ -367,7 +373,7 @@ class TurtleBotEnv(Node, gym.Env):
         # min_obstacle_dist остаётся прежним (или можно пересчитывать)
         return np.array([next_x, next_y, next_angle, min_obstacle_dist], dtype=np.float32)
 
-    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=5.0, k_rep=50.0, d0=8.0, lam=0.5):
+    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=10.0, k_rep=30.0, d0=5.0, lam=0.5):
         current_x, current_y, _, min_obstacle_dist = state
 
         # Преобразуем координаты в пиксельные
@@ -409,28 +415,46 @@ class TurtleBotEnv(Node, gym.Env):
             self.prev_x, self.prev_y = current_x, current_y
         # Проверяем, не ведёт ли высокая потенция в тупик
         
-        if self.lidar_obstacle_detected and potential_value - self.prev_potential > 0.2:
+        if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
             R_fake_path = -5  # Штраф за "ложный проход"
         else:
             R_fake_path = 0
         # Градиент потенциального поля
-        grad_y, grad_x = np.gradient(self.potential_field)
-        local_grad_x = grad_x[current_y, current_x]
-        local_grad_y = grad_y[current_y, current_x]
+        # grad_y, grad_x = np.gradient(self.potential_field)
+        # local_grad_x = grad_x[current_y, current_x]
+        # local_grad_y = grad_y[current_y, current_x]
 
-        # Вектор градиента в текущей точке (направление в сторону роста потенциала)
-        grad_vector = np.array([local_grad_x, local_grad_y])
+        # # Вектор градиента в текущей точке (направление в сторону роста потенциала)
+        # grad_vector = np.array([local_grad_x, local_grad_y])
 
         # Вектор направления движения робота (основанный на угле ориентации)
         motion_direction = np.array([np.cos(self.current_yaw), np.sin(self.current_yaw)])
 
-        # Скалярное произведение: положительное → движение в сторону роста потенциала (плохо), отрицательное → движение в сторону спада (хорошо)
-        projection = np.dot(motion_direction, grad_vector)
+        # Вектор направления к цели или ближайшей промежуточной точке
+        if intermediate_points:
+            nearest_intermediate = min(intermediate_points, key=lambda p: np.linalg.norm([current_x - p[0], current_y - p[1]]))
+            direction_to_goal = np.array([nearest_intermediate[0] - current_x, nearest_intermediate[1] - current_y])
+        else:
+            direction_to_goal = np.array([goal_x - current_x, goal_y - current_y])
 
-        # Награждаем движение против градиента (к цели), штрафуем за движение по градиенту (к препятствию)
-        grad_reward = lam * (-projection)  # Чем больше projection, тем больше штраф, чем меньше — тем больше награда
+        # Нормируем направление к цели
+        norm = np.linalg.norm(direction_to_goal)
+        if norm > 0:
+            direction_to_goal = direction_to_goal / norm
+        else:
+            direction_to_goal = np.array([1.0, 0.0]) 
+
+        # Скалярное произведение: положительное → движение в сторону к цели (хорошо), отрицательное → отклонение
+        projection = np.dot(motion_direction, direction_to_goal)
+
+        # Награждаем движение к цели, штрафуем за отклонение
+        grad_reward = lam * projection  # Чем ближе к +1, тем лучше
+
+        if self.lidar_obstacle_detected and projection < 0:  
+            grad_reward -= 2.0  # Доп. штраф за движение в тупик
+
         logging.info(f"min_obstacle_dist: {min_obstacle_dist}, d0: {d0}, obstacle_detected: {obstacle_detected}")
-        # print(obstacle_detected)
+                # print(obstacle_detected)
         # Отталкивающее поле (штраф за близость к препятствию)
         R_repulsive = -k_rep * max(0, (1 / min_obstacle_dist - 1 / d0)) ** 2 if min_obstacle_dist < d0 and obstacle_detected else 0
 
@@ -442,6 +466,7 @@ class TurtleBotEnv(Node, gym.Env):
         # Итоговая награда
         total_reward = R_potential + R_intermediate + grad_reward + R_repulsive + R_fake_path
         logger.info(f'Total reward: {total_reward}') 
+        # print(f'Total reward from potential field: {total_reward}')
 
         # Обновляем предыдущее положение
         self.prev_x, self.prev_y = current_x, current_y
@@ -476,7 +501,7 @@ class TurtleBotEnv(Node, gym.Env):
         deviation = self.compute_deviation_from_path(state)
         
         # Можно сделать штраф линейным или экспоненциальным в зависимости от задачи
-        penalty = -min(max_penalty, deviation)  # Чем дальше от пути, тем больше штраф
+        penalty = -min(max_penalty, deviation**2)  # Чем дальше от пути, тем больше штраф
         return penalty
 
     def step(self, action):
@@ -511,14 +536,22 @@ class TurtleBotEnv(Node, gym.Env):
         reward = reward_potent_val + reward_optimal_path
         # reward += 50.0 * distance_rate
         # self.past_distance = distance
-
+        # print(obstacle_detected)
         done = False
         if obstacle_detected:
+            self.obstacle_count += 1  # Увеличиваем счетчик
             reward -= 100
-            # print('Reward to collison were done')
+            # print('Reward to collision were done')
             done = False
+            if self.obstacle_count >= 1000:  # Если 100 раз зафиксировали препятствие
+                done = True  # Завершаем эпизод
+                self.obstacle_count = 0
+                print('Episode terminated due to repeated obstacle detection')
+        elif min_obstacle_dist < 0.5:  # Если ближе 50 см
+            reward -= 20 * (0.5 - min_obstacle_dist)  # Чем ближе, тем больше штраф
+            done = False 
         elif distance < 0.3:
-            reward += 120 
+            reward += 100
             done = True
         elif self.steps >= self.max_steps:
             reward -= 100
