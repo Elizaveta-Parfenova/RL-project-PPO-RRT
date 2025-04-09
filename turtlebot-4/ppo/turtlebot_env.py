@@ -387,91 +387,60 @@ class TurtleBotEnv(Node, gym.Env):
 
         goal_x, goal_y = world_to_map(goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape)
 
-        # Потенциал в текущей точке
         potential_value = self.potential_field[current_y, current_x] 
-        delta_potential = self.prev_potential - potential_value  # уменьшение потенциала - хорошо
-        R_potential = max(-delta_potential, -1)  # если двигаемся в правильном направлении - награда, иначе штраф
+        delta_potential = self.prev_potential - potential_value
+        R_potential = np.clip(-delta_potential, -1.0, 1.0)
+        self.prev_potential = potential_value
 
-        self.prev_potential = potential_value  # обновляем предыдущее значение
-
+        # === Притяжение к промежуточной точке ===
+        R_intermediate = 0.0
         if self.prev_x is None or self.prev_y is None:
             self.prev_x, self.prev_y = current_x, current_y
 
-        # Промежуточные точки
         if intermediate_points:
             nearest_intermediate = min(intermediate_points, key=lambda p: np.linalg.norm([current_x - p[0], current_y - p[1]]))
-            # print(nearest_intermediate)
             prev_dist = np.linalg.norm([self.prev_x - nearest_intermediate[0], self.prev_y - nearest_intermediate[1]])
-            # print(prev_dist)
             curr_dist = np.linalg.norm([current_x - nearest_intermediate[0], current_y - nearest_intermediate[1]])
-            # print(curr_dist)
-            R_intermediate = k_att * (prev_dist - curr_dist)  # если приблизился - награда, если удалился - штраф
-        else:
-            R_intermediate = 0
+            R_intermediate = np.clip(k_att * (prev_dist - curr_dist), -1.0, 1.0)
 
-        logger.info(f'Nearest intermediate: {nearest_intermediate}, Prev dist: {prev_dist:.3f}, Curr dist: {curr_dist:.3f}, Diff: {prev_dist - curr_dist:.3f}')
-        
-        if np.linalg.norm([current_x - self.prev_x, current_y - self.prev_y]) > 1e-3:
-            self.prev_x, self.prev_y = current_x, current_y
-        # Проверяем, не ведёт ли высокая потенция в тупик
-        
-        if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
-            R_fake_path = -5  # Штраф за "ложный проход"
-        else:
-            R_fake_path = 0
-        # Градиент потенциального поля
-        # grad_y, grad_x = np.gradient(self.potential_field)
-        # local_grad_x = grad_x[current_y, current_x]
-        # local_grad_y = grad_y[current_y, current_x]
-
-        # # Вектор градиента в текущей точке (направление в сторону роста потенциала)
-        # grad_vector = np.array([local_grad_x, local_grad_y])
-
-        # Вектор направления движения робота (основанный на угле ориентации)
+        # === Градиент к цели ===
         motion_direction = np.array([np.cos(self.current_yaw), np.sin(self.current_yaw)])
-
-        # Вектор направления к цели или ближайшей промежуточной точке
-        if intermediate_points:
-            nearest_intermediate = min(intermediate_points, key=lambda p: np.linalg.norm([current_x - p[0], current_y - p[1]]))
-            direction_to_goal = np.array([nearest_intermediate[0] - current_x, nearest_intermediate[1] - current_y])
-        else:
-            direction_to_goal = np.array([goal_x - current_x, goal_y - current_y])
-
-        # Нормируем направление к цели
+        direction_to_goal = np.array([goal_x - current_x, goal_y - current_y])
         norm = np.linalg.norm(direction_to_goal)
-        if norm > 0:
-            direction_to_goal = direction_to_goal / norm
-        else:
-            direction_to_goal = np.array([1.0, 0.0]) 
-
-        # Скалярное произведение: положительное → движение в сторону к цели (хорошо), отрицательное → отклонение
+        direction_to_goal = direction_to_goal / norm if norm > 0 else np.array([1.0, 0.0])
         projection = np.dot(motion_direction, direction_to_goal)
+        grad_reward = np.clip(lam * projection, -1.0, 1.0)
 
-        # Награждаем движение к цели, штрафуем за отклонение
-        grad_reward = lam * projection  # Чем ближе к +1, тем лучше
+        if self.lidar_obstacle_detected and projection < 0:
+            grad_reward -= 2.0
 
-        if self.lidar_obstacle_detected and projection < 0:  
-            grad_reward -= 2.0  # Доп. штраф за движение в тупик
+        # === Отталкивающее поле ===
+        R_repulsive = 0.0
+        if min_obstacle_dist < d0 and obstacle_detected:
+            R_repulsive = -k_rep * (1 / min_obstacle_dist - 1 / d0) ** 2
+            R_repulsive = np.clip(R_repulsive, -10.0, 0.0)
 
-        logging.info(f"min_obstacle_dist: {min_obstacle_dist}, d0: {d0}, obstacle_detected: {obstacle_detected}")
-                # print(obstacle_detected)
-        # Отталкивающее поле (штраф за близость к препятствию)
-        R_repulsive = -k_rep * max(0, (1 / min_obstacle_dist - 1 / d0)) ** 2 if min_obstacle_dist < d0 and obstacle_detected else 0
+        # === Штраф за ложный путь ===
+        R_fake_path = 0.0
+        if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
+            R_fake_path = -5.0
 
-        logger.info(f'Potential reward: {R_potential}') 
-        logger.info(f'Inter reward: {R_intermediate}') 
-        logger.info(f'Gradient reward: {grad_reward}') 
-        logger.info(f'Repulsive reward: {R_repulsive}') 
+        # === Суммарная награда ===
+        total_reward = (
+            1.0 * R_potential +
+            1.0 * R_intermediate +
+            1.0 * grad_reward +
+            1.0 * R_repulsive +
+            1.0 * R_fake_path
+        )
+        total_reward = np.clip(total_reward, -50.0, 50.0)
 
-        # Итоговая награда
-        total_reward = R_potential + R_intermediate + grad_reward + R_repulsive + R_fake_path
-        logger.info(f'Total reward: {total_reward}') 
-        # print(f'Total reward from potential field: {total_reward}')
+        # === Логгирование ===
+        logger.info(f"R_potential: {R_potential:.2f}, R_intermediate: {R_intermediate:.2f}, grad: {grad_reward:.2f}, rep: {R_repulsive:.2f}, fake: {R_fake_path:.2f}, total: {total_reward:.2f}")
 
-        # Обновляем предыдущее положение
         self.prev_x, self.prev_y = current_x, current_y
-
         return total_reward
+
     
     def compute_deviation_from_path(self, current_pos):
         """
@@ -501,7 +470,7 @@ class TurtleBotEnv(Node, gym.Env):
         deviation = self.compute_deviation_from_path(state)
         
         # Можно сделать штраф линейным или экспоненциальным в зависимости от задачи
-        penalty = -min(max_penalty, deviation**2)  # Чем дальше от пути, тем больше штраф
+        penalty = -min(max_penalty, deviation*1.5)  # Чем дальше от пути, тем больше штраф
         return penalty
 
     def step(self, action):
@@ -538,30 +507,30 @@ class TurtleBotEnv(Node, gym.Env):
         # self.past_distance = distance
         # print(obstacle_detected)
         done = False
+
+        # Обнаружено препятствие
         if obstacle_detected:
-            self.obstacle_count += 1  # Увеличиваем счетчик
-            reward -= 100
-            # print('Reward to collision were done')
-            done = False
-            if self.obstacle_count >= 1000:  # Если 100 раз зафиксировали препятствие
-                done = True  # Завершаем эпизод
+            self.obstacle_count += 1
+            reward -= 50  # менее агрессивно
+            if self.obstacle_count >= 1000:
+                done = True
                 self.obstacle_count = 0
-                print('Episode terminated due to repeated obstacle detection')
-        elif min_obstacle_dist < 0.5:  # Если ближе 50 см
-            reward -= 20 * (0.5 - min_obstacle_dist)  # Чем ближе, тем больше штраф
-            done = False 
-        elif distance < 0.3:
-            reward += 100
+                print("Episode terminated due to repeated obstacle detection")
+
+        # Очень близко к препятствию
+        if min_obstacle_dist < 0.5:
+            reward -= 20 * (0.5 - min_obstacle_dist)
+
+        # Достигли цели
+        if distance < 0.3:
+            reward += 200
             done = True
-        elif self.steps >= self.max_steps:
+
+        # Превышен лимит шагов
+        if self.steps >= self.max_steps:
             reward -= 100
             done = True
-        else:
-            done = False
         
-        # reward = reward / 100.0 
-        # print(state)
-        logger.info(f'Last reward: {reward}') 
         return state, reward, done, {}
 
     def reset(self):

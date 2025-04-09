@@ -17,7 +17,7 @@ import logging
 logging.basicConfig(filename='training_logs.txt', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def precompute_value_map(grid_map, optimal_path, goal, path_weight = 5.0, obstacle_weight=50.0, goal_weight = 4.0):
+def precompute_value_map(grid_map, optimal_path, goal, path_weight = 5.0, obstacle_weight=10.0, goal_weight = 4.0):
         """ Заполняем таблицу значений критика для всех точек grid_map """
         height, width = grid_map.shape
         value_map = np.zeros((height, width))
@@ -177,10 +177,11 @@ class PPOAgent:
             # if np.isnan(delta):
             #     print(f"NaN in delta: rewards[{t}]={rewards[t]}, next_value={next_value}, values[{t}]={values[t]}")
             advantages[t] = last_gae = delta + self.gamma * self.gaelam * (1 - next_done) * last_gae
+            returns[t] = advantages [t] + values[t]  
         # print('Advanteges:', advantages)
     # Возвраты для обновления критика
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
-        returns = advantages + values[:-1]  
+        # returns = advantages + values[:-1]  
         # print ('Returns:', returns)
         logger.info(f'Returns:  {returns}' )
         logger.info(f'Advanteges:  {advantages}' )
@@ -189,7 +190,7 @@ class PPOAgent:
         return advantages, returns 
     
     # Обновление политик
-    def update(self, states, actions, advantages, returns, old_probs):
+    def update(self, states, actions, advantages, returns, old_probs, values_static):
         states = tf.convert_to_tensor(states, dtype=tf.float32)
         actions = tf.convert_to_tensor(actions, dtype=tf.int32)
         advantages = tf.convert_to_tensor(advantages, dtype=tf.float32)
@@ -217,17 +218,21 @@ class PPOAgent:
         # === Обновление критика ===
         with tf.GradientTape() as tape:
             # Получаем значения из критика
-            values = tf.squeeze(self.critic.call(states))
+            values = self.critic.call(states)
             # print(values)
             # Рассчитываем потерю критика
-            critic_loss = tf.keras.losses.Huber()(returns, values)
+            critic_loss = tf.reduce_mean(tf.square(returns - values))
+            hint_loss = tf.reduce_mean(tf.square(values_static - values))
+            # Итоговый лосс критика
+            total_critic_loss = critic_loss + 0.1 * hint_loss
+
 
         # print(self.critic.trainable_variables)
-        critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
+        critic_grads = tape.gradient(total_critic_loss, self.critic.trainable_variables)
         self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
 
 
-    def train(self, max_episodes=100, batch_size=32):
+    def train(self, max_episodes=500, batch_size=32):
         all_rewards = []
         alpha = 0
         epsilon_min = 0.01
@@ -289,7 +294,7 @@ class PPOAgent:
             advantages, returns = self.compute_advantages(rewards, values_learned, dones)
 
             # Обновляем модель
-            self.update(np.vstack(states), actions, advantages, returns, probs)
+            self.update(np.vstack(states), actions, advantages, returns, probs, values_static)
 
             all_rewards.append(episode_reward)
             print(f'Episode {episode + 1}, Reward: {episode_reward}')

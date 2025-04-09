@@ -76,8 +76,18 @@ class RRTStar:
         h, w = self.grid_map.shape
         if x < 0 or y < 0 or x >= w or y >= h:
             return True
-        # Первый индекс — строка (y), второй — столбец (x)
-        return self.grid_map[y, x] == 1
+
+        # Стандартная проверка
+        if self.grid_map[y, x] == 1:
+            return True
+
+        # Доп. проверка на близость к препятствию
+        neighborhood = self.grid_map[max(0, y-1):y+2, max(0, x-1):x+2]
+        if np.any(neighborhood == 1):
+            return True  # Близко к стене — тоже считается столкновением
+
+        return False
+
 
     # ------------------------------
     # Проверка столкновения вдоль линии между p1 и p2
@@ -165,14 +175,13 @@ class RRTStar:
     # Основной метод планирования пути
     # ------------------------------
     def plan(self):
-        best_paths = []  # Храним все возможные пути
+        best_paths = []
 
         for i in range(self.max_iter):
             random_point = self.get_random_point()
             nearest_node = self.nearest(random_point)
             new_point = self.steer(nearest_node.point, random_point)
 
-            # Проверка на столкновения
             if self.is_collision(new_point) or self.is_line_collision(nearest_node.point, new_point):
                 continue
 
@@ -180,33 +189,26 @@ class RRTStar:
             new_node.cost = nearest_node.cost + np.linalg.norm(np.array(nearest_node.point) - np.array(new_point))
             new_node.parent = nearest_node
 
-            # Поиск ближайших соседей и выбор родителя
             near_nodes = self.get_near_nodes(new_node)
             self.choose_parent(new_node, near_nodes)
             self.node_list.append(new_node)
-
-            # Применяем процесс повторной проводки (rewiring)
             self.rewire(new_node, near_nodes)
 
-            # Проверка, если новая вершина близка к цели
             if np.linalg.norm(np.array(new_node.point) - np.array(self.goal.point)) < self.step_size:
                 if not self.is_line_collision(new_node.point, self.goal.point):
                     self.goal.parent = new_node
                     self.goal.cost = new_node.cost + np.linalg.norm(np.array(new_node.point) - np.array(self.goal.point))
                     self.node_list.append(self.goal)
-
-                    # Сохраняем путь
                     best_paths.append(self.extract_path())
 
-                    # Если путь найден, сразу возвращаем его
-                    return self.extract_path()
+                    if len(best_paths) >= 5:  # Соберём хотя бы 5 путей
+                        break
 
-        # Если не найдено ни одного пути
         if not best_paths:
             return None
 
-        # Выбираем безопасный путь из лучших
         return self.find_safest_path(best_paths)
+
 
     # ------------------------------
     # Извлечение пути от цели до старта
