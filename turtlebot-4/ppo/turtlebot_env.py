@@ -134,47 +134,41 @@ def compute_deviation_from_path(current_pos, optimal_path):
     min_distance = np.min(distances)
     return min_distance
 
-def generate_potential_field(grid_map, goal, path_points, k_att=10.0, k_rep=30.0, d0=5.0, scale = 0.07):
+def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=50.0, d0=5.0, scale = 0.07):
     """
-    Улучшенная генерация потенциального поля:
-    - Притягивающий потенциал (quadratic)
-    - Отталкивающий потенциал (logarithmic attenuation)
-    - Промежуточные точки маршрута усиливают притягивающий потенциал
+    Генерация потенциального поля:
+    - Квадратичное притяжение к цели и промежуточным точкам.
+    - Квадратичное отталкивание от препятствий в радиусе d0.
     """
     height, width = grid_map.shape
     y_coords, x_coords = np.indices(grid_map.shape)
     obstacles = np.argwhere(grid_map == 1)
 
+    # Притягивающее поле к цели
+    dx_goal = x_coords - goal[0]
+    dy_goal = y_coords - goal[1]
+    distance_to_goal = np.sqrt(dx_goal**2 + dy_goal**2)
+    att_field = -0.5 * k_att * np.exp(-scale * distance_to_goal)
 
-    # Притягивающее поле (quadratic attraction)
-    dx = x_coords - goal[0]
-    dy = y_coords - goal[1]
-    visibility_mask = np.ones_like(grid_map, dtype=np.float32)
-    for (y, x) in obstacles:
-        visibility_mask[y, x] = 0  # Препятствия скрывают цель
-    att_field = -0.5 * k_att * np.exp(-scale * np.sqrt(dx**2 + dy**2)) * (0.5 + 0.5 * visibility_mask)
-
-
-    # Дополнительное притяжение к промежуточным точкам
+    # Притяжение к промежуточным точкам пути
     att_points = np.zeros_like(grid_map, dtype=np.float32)
     for pt in path_points:
         dx_pt = x_coords - pt[0]
         dy_pt = y_coords - pt[1]
-        att_points += -0.5 * k_att * np.exp(-scale * np.sqrt(dx_pt**2 + dy_pt**2))
+        distance_to_pt = np.sqrt(dx_pt**2 + dy_pt**2)
+        att_points += -0.5 * k_att * np.exp(-scale * distance_to_pt)
 
-    # Отталкивающее поле (logarithmic attenuation)
-    rep_field = np.zeros_like(grid_map, dtype=np.float64)
-    
+    # Отталкивающее поле от препятствий
+    rep_field = np.zeros_like(grid_map, dtype=np.float32)
     for (y, x) in obstacles:
         dist_map = np.sqrt((x_coords - x)**2 + (y_coords - y)**2)
-        mask = (dist_map < d0) & (dist_map > 0)
-        rep_field[mask] += k_rep / (dist_map[mask]**2 + 1e-3)
+        mask = (dist_map <= d0) & (dist_map > 0)
+        inv_dist = 1 / (dist_map[mask] + 1e-5)
+        rep_field[mask] += 0.5 * k_rep * (inv_dist - 1/d0)**2
 
-    # Итоговое поле
+    # Итоговое поле (притяжение - отталкивание)
     field = att_field + att_points + rep_field
-
     return field
-
 
 class TurtleBotEnv(Node, gym.Env):
     def __init__(self):
@@ -219,7 +213,7 @@ class TurtleBotEnv(Node, gym.Env):
         self.steps = 0 
         self.recent_obstacles = []
         
-        self.action_space = spaces.Discrete(3)  
+        self.action_space = spaces.Box(low=np.array([0.0, -2.84]), high=np.array([0.22, 2.84]), dtype=np.float32)
         self.observation_space = spaces.Box(low=np.array([-10.0, -10.0, -np.pi, 0.0]), 
                                             high=np.array([10.0, 10.0, np.pi, 12.0]), 
                                             shape=(4,), dtype=np.float32)
@@ -341,39 +335,8 @@ class TurtleBotEnv(Node, gym.Env):
         # print(obstacle_detected)
         return obstacle_detected
     
-    def get_next_state(self, state, action, angle):
-        """
-        Предсказывает следующее состояние на основе текущего состояния, действия и переданного угла.
-
-        :param state: текущее состояние [x, y, min_obstacle_dist] (без угла)
-        :param action: выбранное действие (0 - поворот вправо, 1 - движение вперёд, 2 - поворот влево)
-        :param angle: текущий угол робота (передаётся отдельно)
-        :return: следующее состояние [next_x, next_y, next_min_obstacle_dist], next_angle
-        """
-        current_x, current_y, _, min_obstacle_dist = state.squeeze()  # Распаковываем текущее состояние
-        next_x, next_y = current_x, current_y  # По умолчанию остаются неизменными
-        next_angle = angle # Начинаем с текущего угла
-        logger.info(f'Next_angel in get_next_state (current_yaw): {next_angle}') 
-        # print(next_angle)
-        # Определяем действие
-        if action == 0:  # Поворот вправо
-            next_angle = angle - 0.5  
-        elif action == 1:  # Движение вперёд
-            if not (self.x_range[0] <= next_x <= self.x_range[1] and self.y_range[0] <= next_y <= self.y_range[1]):
-                next_x, next_y = current_x, current_y  # Оставляем на местея
-            else:
-                next_x = current_x + np.cos(angle) * 0.2  # Двигаемся в направлении угла
-                next_y = current_y + np.sin(angle) * 0.2
-        elif action == 2:  
-            next_angle = angle + 0.5  # Увеличиваем угол
-
-        # Ограничиваем угол в диапазоне [-π, π]
-        next_angle = (next_angle + np.pi) % (2 * np.pi) - np.pi
-
-        # min_obstacle_dist остаётся прежним (или можно пересчитывать)
-        return np.array([next_x, next_y, next_angle, min_obstacle_dist], dtype=np.float32)
-
-    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=10.0, k_rep=30.0, d0=5.0, lam=0.5):
+   
+    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=0.3, k_rep=2.0, d0=5.0, lam=0.5):
         current_x, current_y, _, min_obstacle_dist = state
 
         # Преобразуем координаты в пиксельные
@@ -425,6 +388,9 @@ class TurtleBotEnv(Node, gym.Env):
         if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
             R_fake_path = -5.0
 
+        if self.steps % 5 != 0:
+            R_repulsive = 0
+            R_fake_path = 0
         # === Суммарная награда ===
         total_reward = (
             1.0 * R_potential +
@@ -433,7 +399,7 @@ class TurtleBotEnv(Node, gym.Env):
             1.0 * R_repulsive +
             1.0 * R_fake_path
         )
-        total_reward = np.clip(total_reward, -50.0, 50.0)
+        total_reward = np.clip(total_reward, -10.0, 10.0)
 
         # === Логгирование ===
         logger.info(f"R_potential: {R_potential:.2f}, R_intermediate: {R_intermediate:.2f}, grad: {grad_reward:.2f}, rep: {R_repulsive:.2f}, fake: {R_fake_path:.2f}, total: {total_reward:.2f}")
@@ -454,7 +420,7 @@ class TurtleBotEnv(Node, gym.Env):
         min_distance = np.min(distances)
         return min_distance
 
-    def get_deviation_penalty(self, current_pos, max_penalty=10):
+    def get_deviation_penalty(self, current_pos, max_penalty=1):
         """
         Рассчитывает штраф за отклонение от пути.
         :param current_pos: (x, y) текущая позиция агента.
@@ -470,18 +436,16 @@ class TurtleBotEnv(Node, gym.Env):
         deviation = self.compute_deviation_from_path(state)
         
         # Можно сделать штраф линейным или экспоненциальным в зависимости от задачи
-        penalty = -min(max_penalty, deviation*1.5)  # Чем дальше от пути, тем больше штраф
+        penalty = -min(max_penalty, deviation)  # Чем дальше от пути, тем больше штраф
         return penalty
 
     def step(self, action):
         cmd_msg = Twist()
-        if action == 0:
-            cmd_msg.angular.z = 0.5  
-        elif action == 1:
-            cmd_msg.linear.x = 0.2  
-        elif action == 2:
-            cmd_msg.angular.z = -0.5  
-        
+        linear = float(np.clip(action[0], 0.0, 0.22))
+        angular = float(np.clip(action[1], -2.84, 2.84))
+
+        cmd_msg.linear.x = linear
+        cmd_msg.angular.z = angular
         rclpy.spin_once(self, timeout_sec=0.1) 
         self.publisher_.publish(cmd_msg)
     
@@ -502,54 +466,76 @@ class TurtleBotEnv(Node, gym.Env):
         reward_potent_val = self.compute_potential_reward(state, self.goal, self.optimal_path, obstacle_detected)
         reward_optimal_path = self.get_deviation_penalty(state[:2])
 
-        reward = reward_potent_val + reward_optimal_path
-        # reward += 50.0 * distance_rate
-        # self.past_distance = distance
-        # print(obstacle_detected)
+        # Награда за приближение к цели
+        reward_goal_progress = 0.0
+        if self.prev_distance is not None:
+            delta = self.prev_distance - distance
+            reward_goal_progress = np.clip(delta * 100.0, -10.0, 10.0)  # усиленный сигнал
+        self.prev_distance = distance
+
+        # Общая награда
+        reward = reward_potent_val + reward_goal_progress + reward_optimal_path
+
+        # ====== Терминальные случаи ======
         done = False
 
-        # Обнаружено препятствие
+        # 1. Обнаружено препятствие
         if obstacle_detected:
             self.obstacle_count += 1
-            reward -= 50  # менее агрессивно
-            if self.obstacle_count >= 1000:
+            reward -= 5  # менее жёстко
+            if self.obstacle_count >= 100:
                 done = True
                 self.obstacle_count = 0
                 print("Episode terminated due to repeated obstacle detection")
 
-        # Очень близко к препятствию
+        # 2. Очень близко к препятствию
         if min_obstacle_dist < 0.5:
-            reward -= 20 * (0.5 - min_obstacle_dist)
+            reward -= 10 * (0.5 - min_obstacle_dist)
 
-        # Достигли цели
+        # 3. Достигли цели
         if distance < 0.3:
-            reward += 200
+            reward += 300  # усиленное вознаграждение
             done = True
+            print("Goal reached!")
 
-        # Превышен лимит шагов
+        # 4. Превышен лимит шагов
         if self.steps >= self.max_steps:
-            reward -= 100
+            reward -= 50  # чуть мягче
             done = True
-        
+            print("Episode terminated due to step limit")
+
+        # 5. Безопасное ограничение награды
+        reward = np.clip(reward, -20.0, 30.0)
+
         return state, reward, done, {}
 
+
     def reset(self):
-    # Остановить движение
+        # === 1. Остановить движение ===
         cmd_msg = Twist()
         cmd_msg.linear.x = 0.0  
         cmd_msg.angular.z = 0.0
         self.publisher_.publish(cmd_msg)  
-        rclpy.spin_once(self, timeout_sec=0.1) 
-    
-        # Использовать reset_simulation для физического сброса в Gazebo
+        rclpy.spin_once(self, timeout_sec=0.1)
+
+        # === 2. Сброс симуляции ===
         client = self.create_client(Empty, '/reset_simulation')
         request = Empty.Request()
         if client.wait_for_service(timeout_sec=1.0):
-            client.call_async(request)
+            future = client.call_async(request)
+            while not future.done():
+                rclpy.spin_once(self, timeout_sec=0.1)
         else:
             self.get_logger().warn('Gazebo reset service not available!')
 
-    # Сбросить внутренние переменные
+        # === 3. Ждём, пока обновится одометрия после сброса ===
+        timeout_counter = 0
+        while (abs(self.current_x) < 0.01 and abs(self.current_y) < 0.01 and 
+            abs(self.current_yaw) < 1e-3 and timeout_counter < 50):
+            rclpy.spin_once(self, timeout_sec=0.1)
+            timeout_counter += 1
+
+        # === 4. Обновляем переменные среды ===
         self.current_x = -2.0
         self.current_y = -0.5
         self.current_yaw = 0.0
@@ -557,7 +543,15 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_distance = None
         self.obstacles = []
         self.camera_obstacle_detected = False
-        return np.array([self.current_x, self.current_y, 0.0, 0.0])  
+        self.prev_potential = 0
+        self.prev_x = None
+        self.prev_y = None
+        self.obstacle_count = 0
+
+        # === 5. Возвращаем корректное состояние ===
+        min_obstacle_dist = 3.5 if not self.obstacles else min(self.obstacles)
+        return np.array([self.current_x, self.current_y, self.current_yaw, min_obstacle_dist])
+
  
     def render(self, mode='human'):
         pass

@@ -1,8 +1,8 @@
 import gym
 import numpy as np
 import tensorflow as tf
-# from tensorflow import kears
-from keras import layers
+from tensorflow import keras
+from tensorflow.keras import layers
 import rclpy
 from my_turtlebot_package.turtlebot_env import TurtleBotEnv
 from my_turtlebot_package.actor_net import ImprovedActor
@@ -17,36 +17,49 @@ import logging
 logging.basicConfig(filename='training_logs.txt', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def precompute_value_map(grid_map, optimal_path, goal, path_weight = 5.0, obstacle_weight=10.0, goal_weight = 4.0):
-        """ Заполняем таблицу значений критика для всех точек grid_map """
-        height, width = grid_map.shape
-        value_map = np.zeros((height, width))
+def precompute_value_map(grid_map, optimal_path, goal, path_weight=5.0, obstacle_weight=1.0, goal_weight=4.0):
+    """ Предобученная карта значений для статичного критика """
+    height, width = grid_map.shape
+    value_map = np.zeros((height, width))
 
-        # Вычисляем расстояние от каждой точки карты до ближайшего препятствия
-        obstacle_mask = (grid_map == 1)
-        obstacle_distances = distance_transform_edt(obstacle_mask)  # Чем ближе к препятствию, тем меньше значение
+    # Препятствия
+    obstacle_mask = (grid_map == 1)
+    obstacle_distances = distance_transform_edt(obstacle_mask)
+    obstacle_distances = np.clip(obstacle_distances, 1e-3, None)
 
-        # Вычисляем расстояние от каждой точки до ближайшей точки пути
-        path_mask = np.zeros_like(grid_map, dtype=bool)
-        for x, y in optimal_path:  # optimal_path — список (x, y)
-            path_mask[y, x] = True
-        path_distances = distance_transform_edt(~path_mask)  # Чем ближе к пути, тем меньше значение
+    # Расстояние до пути
+    path_mask = np.zeros_like(grid_map, dtype=bool)
+    for x, y in optimal_path:
+        path_mask[y, x] = True
+    path_distances = distance_transform_edt(~path_mask)
+    max_path = np.max(path_distances)
+    path_values = max_path - path_distances  # ближе — больше
+    path_values = (path_values - path_values.min()) / (path_values.max() - path_values.min() + 1e-8)
 
-        goal_x, goal_y = world_to_map(goal, resolution=0.05, origin=(-4.86, -7.36),
-                                    map_offset=(45, 15), map_shape= grid_map.shape)
-        # print(goal_x, goal_y)
-        goal_mask = np.zeros_like(grid_map, dtype=bool)
-        goal_mask[goal_y, goal_x] = True
-        goal_distances = distance_transform_edt(~goal_mask)  # Чем ближе к цели, тем меньше значение
+    # Расстояние до цели
+    goal_x, goal_y = world_to_map(goal, resolution=0.05, origin=(-4.86, -7.36),
+                                   map_offset=(45, 15), map_shape=grid_map.shape)
+    goal_mask = np.zeros_like(grid_map, dtype=bool)
+    goal_mask[goal_y, goal_x] = True
+    goal_distances = distance_transform_edt(~goal_mask)
+    max_goal = np.max(goal_distances)
+    goal_values = max_goal - goal_distances
+    goal_values = (goal_values - goal_values.min()) / (goal_values.max() - goal_values.min() + 1e-8)
 
-        # obstacle_distances = np.clip(obstacle_distances, 0, 5)  # Обрезаем максимальные значения
-        # path_distances = np.clip(path_distances, 0, 5)
-        # goal_distances = np.clip(goal_distances, 0, 5)
+    # Обратная зависимость от близости к препятствиям
+    repulsion_values = np.exp(-obstacle_distances / 1.5)
+    repulsion_values = (repulsion_values - repulsion_values.min()) / (repulsion_values.max() - repulsion_values.min() + 1e-8)
+    # Комбинируем
+    value_map = (
+        path_weight * path_values +
+        goal_weight * goal_values -
+        obstacle_weight * repulsion_values
+    )
 
-        # Создаём градиентное поле
-        value_map = -path_distances * path_weight - obstacle_distances * (obstacle_weight / (obstacle_distances + 1)) - goal_distances * goal_weight
+    # Нормализуем итоговую карту значений (опционально)
+    value_map = (value_map - value_map.min()) / (value_map.max() - value_map.min() + 1e-8)
 
-        return value_map
+    return value_map
 
 def plot_value_map(value_map):
         plt.figure(figsize=(8, 6))
@@ -60,7 +73,7 @@ class PPOAgent:
     def __init__(self, env):
         self.env = env
         self.state_dim = env.observation_space.shape[0]
-        self.action_dim = env.action_space.n
+        self.action_dim = env.action_space.shape[0]
         self.optimal_path = env.optimal_path
         self.grid_map = env.grid_map
 
@@ -104,55 +117,19 @@ class PPOAgent:
         self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=self.actor_lr)
         self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=self.critic_lr)
     
-    def update_alpha(self,episode, max_episodes):
-        alpha = self.min_alpha + (self.max_alpha - self.min_alpha) * (episode / max_episodes)
+    def update_alpha(self, episode, max_episodes):
+        alpha = self.max_alpha - (self.max_alpha - self.min_alpha) * (episode / max_episodes)
         alpha = np.clip(alpha, self.min_alpha, self.max_alpha)
-        alpha = np.float32(alpha)
-        return alpha
+        return np.float32(alpha)
     
-    def get_action(self, state, value_map, alpha, epsilon):
-        state = np.reshape(state, [1, self.state_dim])
-        logger.info(f'State in get_action: {state}') 
-        prob = self.actor(state).numpy().squeeze()
-        prob = np.nan_to_num(prob, nan=1.0/self.action_dim)
-        prob /= np.sum(prob)  # Нормализация
+    def get_action(self, state, alpha, epsilon):
+        state_tensor = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)
+        action_raw, log_prob, entropy, _, _ = self.actor(state_tensor)
+        action = action_raw.numpy().reshape(-1)
 
-        action_values = np.zeros(self.action_dim)
+        return action, log_prob.numpy().squeeze(), entropy.numpy().squeeze()
+    
 
-        for action in range(self.action_dim):
-            next_state = self.env.get_next_state(state, action, self.env.current_yaw)
-
-            # Оценка текущего состояния
-            value_current_learned = self.critic.call(state)
-            value_current_static = self.critic_st.call(state)
-
-            # Оценка будущего состояния
-            value_next_learned = self.critic.call(next_state)
-            value_next_static = self.critic_st.call(next_state)
-
-            # Взвешенное объединение критиков
-            value_current = alpha * value_current_learned + (1 - alpha) * value_current_static
-            value_next = alpha * value_next_learned + (1 - alpha) * value_next_static
-
-            # Усреднение текущей и будущей оценки
-            action_values[action] = 0.3 * value_current + 0.7 * value_next
-            logger.info(f'Action values in get_action before normalization: {action_values}') 
-
-        # Нормализация оценок критика
-        action_values = (action_values - np.min(action_values)) / (np.max(action_values) - np.min(action_values) + 1e-10)
-        logger.info(f'Action values in get_action after normalization: {action_values}')  
-
-        combined_scores = alpha * prob + (1 - alpha) * action_values
-        logger.info(f'Combined scores in get_action: {combined_scores}') 
-
-            # Эпсилон-жадный выбор действия
-        # if np.random.rand() < self.epsilon:
-        #     action = np.random.choice(self.action_dim)
-        # else:
-        #     action = np.argmax(combined_scores)
-        action = np.argmax(combined_scores)
-
-        return action, prob
     # Вычисление преимущесвт и возврата
     def compute_advantages(self, rewards, values, dones):
         # print('Rewrds: ', rewards)
@@ -190,47 +167,45 @@ class PPOAgent:
         return advantages, returns 
     
     # Обновление политик
-    def update(self, states, actions, advantages, returns, old_probs, values_static):
+    def update(self, states, actions, advantages, returns, log_probs_old, values_static, alpha):
         states = tf.convert_to_tensor(states, dtype=tf.float32)
-        actions = tf.convert_to_tensor(actions, dtype=tf.int32)
+        actions = tf.convert_to_tensor(actions, dtype=tf.float32)
+        log_probs_old = tf.convert_to_tensor(log_probs_old, dtype=tf.float32)
         advantages = tf.convert_to_tensor(advantages, dtype=tf.float32)
         returns = tf.convert_to_tensor(returns, dtype=tf.float32)
-        old_probs = tf.convert_to_tensor(old_probs, dtype=tf.float32)
+        values_static = tf.convert_to_tensor(values_static, dtype=tf.float32)
 
-        old_probs = tf.reduce_sum(old_probs * tf.one_hot(actions, depth=self.action_dim), axis=1)
+        entropy_coef = 0.01  # по желанию: можно сделать адаптивным
 
-        # === Обновление актора ===
+        # === Actor update ===
         with tf.GradientTape() as tape:
-            prob = self.actor(states)
-            chosen_probs = tf.reduce_sum(prob * tf.one_hot(actions, depth=self.action_dim), axis=1)
+            _, log_probs, entropy, _, _ = self.actor(states)
+            log_probs = tf.reduce_sum(log_probs, axis=-1)
+            ratios = tf.exp(log_probs - log_probs_old)
+            clipped_ratios = tf.clip_by_value(ratios, 1.0 - self.epsilon, 1.0 + self.epsilon)
+            surrogate1 = ratios * advantages
+            surrogate2 = clipped_ratios * advantages
+            actor_loss = -tf.reduce_mean(tf.minimum(surrogate1, surrogate2))
 
-            prob_ratio = chosen_probs / old_probs
-            clipped_prob_ratio = tf.clip_by_value(prob_ratio, 1.0 - self.epsilon, 1.0 + self.epsilon)
+            # ➕ добавим энтропийный бонус
+            entropy_bonus = tf.reduce_mean(entropy)
+            actor_loss -= entropy_coef * entropy_bonus
 
-            surrogate_loss = tf.minimum(prob_ratio * advantages, clipped_prob_ratio * advantages)
-            logger.info(f'Surrogate loss: {surrogate_loss}')
-            actor_loss = -tf.reduce_mean(surrogate_loss)
-            logger.info(f'Acotor loss: {actor_loss}')
-            
         actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
         self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
 
-        # === Обновление критика ===
+        # === Critic update ===
         with tf.GradientTape() as tape:
-            # Получаем значения из критика
-            values = self.critic.call(states)
-            # print(values)
-            # Рассчитываем потерю критика
+            
+            values = self.critic.call(states)  # shape (batch, 1)
+            # values = tf.squeeze(values, axis=1)  # shape (batch,)
+            # values_static = tf.broadcast_to(values_static, values.shape)
             critic_loss = tf.reduce_mean(tf.square(returns - values))
             hint_loss = tf.reduce_mean(tf.square(values_static - values))
-            # Итоговый лосс критика
-            total_critic_loss = critic_loss + 0.1 * hint_loss
+            total_critic_loss = critic_loss + alpha * hint_loss
 
-
-        # print(self.critic.trainable_variables)
         critic_grads = tape.gradient(total_critic_loss, self.critic.trainable_variables)
         self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
-
 
     def train(self, max_episodes=500, batch_size=32):
         all_rewards = []
@@ -247,10 +222,9 @@ class PPOAgent:
             values_learned, values_static = [], []
 
             while not done:
-                alpha = self.update_alpha(episode, max_episodes)
-                action, prob = self.get_action(state, self.value_map, alpha, epsilon)
+                action, log_prob, _ = self.get_action(state, alpha, epsilon)
                 logger.info(f'Action:  {action}')
-                logger.info(f'Prob:  {prob}')
+                logger.info(f'Prob:  {log_prob}')
                 next_state, reward, done, _ = self.env.step(action)
                 
                 if np.isnan(next_state).any():
@@ -269,7 +243,7 @@ class PPOAgent:
                 actions.append(action)
                 rewards.append(reward)
                 dones.append(done)
-                probs.append(prob)
+                probs.append(log_prob)
                 values_learned.append(value_learned)
                 values_static.append(value_static)
 
@@ -278,6 +252,8 @@ class PPOAgent:
                 logger.info(f'Episode reward  {episode_reward}')
 
             epsilon = max(epsilon_min, epsilon * epsilon_decay)
+            if len(rewards) < 10:
+                continue
 
             # Последнее значение критика
             next_value_learned = self.critic.call(next_state)[0, 0]
@@ -292,9 +268,10 @@ class PPOAgent:
             # Вычисляем `advantages` и `returns`
             # print(alpha)
             advantages, returns = self.compute_advantages(rewards, values_learned, dones)
-
+            alpha = self.update_alpha(episode, max_episodes)
             # Обновляем модель
-            self.update(np.vstack(states), actions, advantages, returns, probs, values_static)
+            states = np.vstack(states).reshape(-1, self.state_dim)
+            self.update(np.vstack(states), actions, advantages, returns, probs, values_static, alpha)
 
             all_rewards.append(episode_reward)
             print(f'Episode {episode + 1}, Reward: {episode_reward}')
