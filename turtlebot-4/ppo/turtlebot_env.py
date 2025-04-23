@@ -137,7 +137,7 @@ def compute_deviation_from_path(current_pos, optimal_path):
     min_distance = np.min(distances)
     return min_distance
 
-def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=50.0, d0=5.0, scale = 0.07):
+def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=10.0, d0=3.0, scale = 0.07):
     """
     Генерация потенциального поля:
     - Квадратичное притяжение к цели и промежуточным точкам.
@@ -151,7 +151,8 @@ def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=50.0,
     dx_goal = x_coords - goal[0]
     dy_goal = y_coords - goal[1]
     distance_to_goal = np.sqrt(dx_goal**2 + dy_goal**2)
-    att_field = -0.5 * k_att * np.exp(-scale * distance_to_goal)
+    # att_field = -0.5 * k_att * np.exp(-scale * distance_to_goal)
+    att_field = -0.5 * k_att * (distance_to_goal ** 2)
 
     # Притяжение к промежуточным точкам пути
     att_points = np.zeros_like(grid_map, dtype=np.float32)
@@ -159,7 +160,8 @@ def generate_potential_field(grid_map, goal, path_points, k_att=5.0, k_rep=50.0,
         dx_pt = x_coords - pt[0]
         dy_pt = y_coords - pt[1]
         distance_to_pt = np.sqrt(dx_pt**2 + dy_pt**2)
-        att_points += -0.5 * k_att * np.exp(-scale * distance_to_pt)
+        # att_points += -0.5 * k_att * np.exp(-scale * distance_to_pt)
+        att_points += -0.5 * k_att * (distance_to_pt ** 2)
 
     # Отталкивающее поле от препятствий
     rep_field = np.zeros_like(grid_map, dtype=np.float32)
@@ -215,7 +217,7 @@ class TurtleBotEnv(Node, gym.Env):
         self.obstacles = []
         self.prev_distance = None
         self.past_distance = 0
-        self.max_steps = 700
+        self.max_steps = 500
         self.steps = 0 
         self.recent_obstacles = []
         
@@ -342,7 +344,7 @@ class TurtleBotEnv(Node, gym.Env):
         return obstacle_detected
     
    
-    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=0.3, k_rep=2.0, d0=5.0, lam=0.5):
+    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, k_att=5.0, k_rep=10.0, d0=3.0, lam=0.5):
         current_x, current_y, _, min_obstacle_dist = state
 
         # Преобразуем координаты в пиксельные
