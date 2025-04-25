@@ -308,7 +308,7 @@ class TurtleBotEnv(Node, gym.Env):
         # Логика определения препятствий
         self.lidar_obstacle_detected = (
             (min_obstacle_dist < 0.2) and (  # Лидар обнаружил близкое препятствие И
-                (potential_value > 3) or  # Более чувствительный порог
+                (potential_value > 1) or  # Более чувствительный порог
                 # (potential_value > np.percentile(self.potential_field, 90)) or  # Высокий потенциал
                 (camera_obstacle_count >= camera_obstacle_threshold)  # Камера часто видела препятствие
             )
@@ -415,18 +415,19 @@ class TurtleBotEnv(Node, gym.Env):
         # === Отталкивающее поле ===
         R_repulsive = 0.0
         if min_obstacle_dist < d0 and obstacle_detected:
-            R_repulsive = -k_rep * (1 / min_obstacle_dist - 1 / d0) ** 2
+            R_repulsive = -k_rep * 0.02 * (1 / min_obstacle_dist - 1 / d0) ** 2
 
         # # === Штраф за ложный путь ===
-        # R_fake_path = 0.0
-        # if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
-        #     R_fake_path = -5.0
+        R_fake_path = 0.0
+        if self.lidar_obstacle_detected and (potential_value - self.prev_potential > 0.2 or potential_value == self.prev_potential):
+            R_fake_path = -5.0
 
         # === Суммарная награда ===
         total_reward = (
             1.0 * R_potential +
             1.0 * R_intermediate +
-            1.0 * R_repulsive 
+            1.0 * R_repulsive +
+            1.0 * R_fake_path
         )
         # total_reward = np.clip(total_reward, -10.0, 10.0)
 
@@ -496,7 +497,7 @@ class TurtleBotEnv(Node, gym.Env):
         dy = self.current_y - prev_yw
         disp = np.array([dx, dy])
         dist_forward = np.dot(disp, to_goal)              # скалярная проекция смещения
-        forward_reward = 3.0 * dist_forward
+        forward_reward = 10.0 * dist_forward
         # reward += forward_reward
 
         # spin_penalty = - self.beta_spin * abs(angular)
@@ -518,8 +519,8 @@ class TurtleBotEnv(Node, gym.Env):
                 print("Episode terminated due to repeated obstacle detection")
 
         # 2. Очень близко к препятствию
-        if min_obstacle_dist < 0.5:
-            reward -= 10 * (0.5 - min_obstacle_dist)
+        if min_obstacle_dist < 0.3:
+            reward -= 5 * (0.3 - min_obstacle_dist)
 
         # 3. Достигли цели
         if distance < 0.3:

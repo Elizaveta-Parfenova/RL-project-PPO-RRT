@@ -56,7 +56,7 @@ class ImprovedActor(tf.keras.Model):
             bias_initializer=initializers.Constant(-3.0)
         )
 
-    def call(self, obs, training=False):
+    def call(self, obs, training=False, raw_actions = None):
         if isinstance(obs, np.ndarray):
             obs = tf.convert_to_tensor(obs, dtype=tf.float32)
 
@@ -70,7 +70,6 @@ class ImprovedActor(tf.keras.Model):
 
         mu = self.mu_layer(x)
         mu = tf.clip_by_value(mu, -1.0, 1.0)
-        mu_scaled = self.action_low + (mu + 1.0) * 0.5 * (self.action_high - self.action_low)
 
         log_std = self.log_std_layer(x)
         std = tf.exp(log_std)
@@ -80,18 +79,26 @@ class ImprovedActor(tf.keras.Model):
             distribution=base_dist,
             bijector=tfp.bijectors.Tanh()
         )
+        if raw_actions is None:
 
-        # 1) Сэмплируем действие в [-1,1] уже внутри bi-вектора
-        raw_action = dist.sample()
-        # 2) Маппим в ваш диапазон [action_low, action_high]
-        action_scaled = self.action_low + (raw_action + 1.0) * 0.5 * (self.action_high - self.action_low)
+            # 1) Сэмплируем действие в [-1,1] уже внутри bi-вектора
+            raw_action = dist.sample()
+            # 2) Маппим в ваш диапазон [action_low, action_high]
+            action_scaled = self.action_low + (raw_action + 1.0) * 0.5 * (self.action_high - self.action_low)
 
-        # 3) Лог‑правдоподобие и энтропия считаем уже в «реальном» пространстве
-        log_prob = tf.reduce_sum(dist.log_prob(raw_action), axis=-1)
-        entropy  = tf.reduce_sum(base_dist.entropy(), axis=-1)
+            # 3) Лог‑правдоподобие и энтропия считаем уже в «реальном» пространстве
+            log_prob = tf.reduce_sum(dist.log_prob(raw_action), axis=-1)
+            entropy  = tf.reduce_sum(base_dist.entropy(), axis=-1)
+
+            return action_scaled, log_prob, entropy, std
+        else:
+
+            log_prob = tf.reduce_sum(dist.log_prob(raw_actions), axis=-1)
+            entropy  = tf.reduce_sum(base_dist.entropy(), axis=-1)
+
+            return log_prob, entropy
 
 
-        return action_scaled, log_prob, entropy, mu_scaled, std
 
     
     def get_config(self):

@@ -3,6 +3,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+import tensorflow_probability as tfp
 import rclpy
 from turtlebot_env import TurtleBotEnv
 from actor_net import ImprovedActor
@@ -124,7 +125,7 @@ class PPOAgent:
     
     def get_action(self, state):
         state_tensor = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)
-        action_raw, log_prob, entropy, mu, std = self.actor(state_tensor)
+        action_raw, log_prob, entropy, std = self.actor(state_tensor, raw_actions = None)
         action = action_raw.numpy().squeeze()
         logger.info(f"Policy std: {std.numpy().squeeze()}, entropy: {entropy.numpy().squeeze()}")
 
@@ -168,17 +169,17 @@ class PPOAgent:
         return advantages, returns 
     
     # Обновление политик
-    def update(self, states, actions, advantages, returns, log_probs_old, values_static, entropy_coef):
+    def update(self, states, actions, advantages, returns, log_probs_old, entropy_coef):
         states = tf.convert_to_tensor(states, dtype=tf.float32)
         actions = tf.convert_to_tensor(actions, dtype=tf.float32)
         log_probs_old = tf.convert_to_tensor(log_probs_old, dtype=tf.float32)
         advantages = tf.convert_to_tensor(advantages, dtype=tf.float32)
         returns = tf.convert_to_tensor(returns, dtype=tf.float32)
-        values_static = tf.convert_to_tensor(values_static, dtype=tf.float32)
+
 
         # === Actor update ===
         with tf.GradientTape() as tape:
-            _, log_probs, entropy, _, _ = self.actor(states, training = True)
+            log_probs, entropy = self.actor(states, training = False, raw_actions = actions)
             # log_probs = tf.reduce_sum(log_probs, axis=-1)
             ratios = tf.exp(log_probs - log_probs_old)
             clipped_ratios = tf.clip_by_value(ratios, 1.0 - self.epsilon, 1.0 + self.epsilon)
@@ -186,17 +187,17 @@ class PPOAgent:
             surrogate2 = clipped_ratios * advantages
             actor_loss = -tf.reduce_mean(tf.minimum(surrogate1, surrogate2))
 
-            # ➕ добавим энтропийный бонус
             entropy_bonus = tf.reduce_mean(entropy)
-            actor_loss -= entropy_coef * entropy_bonus
 
-        actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
+            actor_loss_full = actor_loss - entropy_coef * entropy_bonus
+
+        actor_grads = tape.gradient(actor_loss_full, self.actor.trainable_variables)
         self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
 
         # === Critic update ===
         with tf.GradientTape() as tape:
             
-            values = self.critic.call(states, training = True)  # shape (batch, 1)
+            values = self.critic.call(states, training = False)  # shape (batch, 1)
             critic_loss = tf.reduce_mean(tf.square(returns - values))
 
         critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
@@ -211,7 +212,7 @@ class PPOAgent:
         window = 10
         for episode in range(max_episodes):
             state = np.reshape(self.env.reset(), [1, self.state_dim])
-            print(f"Initial state: {state}, shape = {state.shape}, ndim = {state.ndim}")
+            # print(f"Initial state: {state}, shape = {state.shape}, ndim = {state.ndim}")
             episode_reward = 0
             done = False
 
@@ -267,7 +268,7 @@ class PPOAgent:
             advantages, returns = self.compute_advantages(rewards, values_learned, dones)
             entropy_coef = self.update_entropy_coef(episode, max_episodes)
             # Обновляем модель
-            self.update(np.vstack(states), actions, advantages, returns, probs, values_static, entropy_coef)
+            self.update(np.vstack(states), actions, advantages, returns, probs, entropy_coef)
 
             all_rewards.append(episode_reward)
 
