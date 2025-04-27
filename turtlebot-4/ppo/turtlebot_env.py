@@ -148,7 +148,7 @@ def compute_deviation_from_path(current_pos, optimal_path):
     return min_distance
 
 def generate_potential_field(grid_map, goal, path_points, resolution = 0.05, 
-                             k_att=4.0, k_rep=10.0, d0=3.5, scale = 0.05, normalize = False):
+                             k_att=100.0, k_rep=300.0, d0=80.0, scale = 0.07, normalize = False):
     """
     Генерация потенциального поля:
       - Квадратичное притяжение к цели и оптимальному пути.
@@ -234,7 +234,7 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_y = None  # Предыдущая координата Y
         self.obstacle_count = 0  
         self.lam = 0.5
-        self.beta_spin = 0.05
+        self.beta_spin = 0.1
         self.reward_scale = 0.15
         self.odom_updated = False 
 
@@ -250,7 +250,7 @@ class TurtleBotEnv(Node, gym.Env):
         self.wp_index = 0
         self.wp_threshold = 0.3
         
-        self.action_space = spaces.Box(low=np.array([0.0, -1.82]), high=np.array([0.26, 1.82]), dtype=np.float32)
+        self.action_space = spaces.Box(low=np.array([0.05, -1.82]), high=np.array([0.26, 1.82]), dtype=np.float32)
         self.observation_space = spaces.Box(low=np.array([-10.0, -10.0, -np.pi, 0.0]), 
                                             high=np.array([10.0, 10.0, np.pi, 12.0]), 
                                             shape=(4,), dtype=np.float32)
@@ -387,7 +387,7 @@ class TurtleBotEnv(Node, gym.Env):
         return obstacle_detected
     
    
-    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, resolution = 0.05, k_att=5.0, k_rep=10.0, d0=3.0, lam=0.5):
+    def compute_potential_reward(self, state, goal, intermediate_points, obstacle_detected, resolution = 0.05, k_att=5.0, k_rep=15.0, d0=4.0, lam=0.5):
         current_x, current_y, _, min_obstacle_dist = state
 
         # Преобразуем координаты в пиксельные
@@ -402,8 +402,9 @@ class TurtleBotEnv(Node, gym.Env):
         # goal_x, goal_y = world_to_map(goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape)
 
         potential_value = self.potential_field[current_y_, current_x_] 
-        delta_potential = self.prev_potential - potential_value
-        R_potential = delta_potential * resolution
+        delta_potential = potential_value - self.prev_potential 
+        R_potential = - delta_potential * resolution
+        delta_potential = np.clip(delta_potential, -10.0, 10.0)
 
         # === Притяжение к промежуточной точке ===
         R_intermediate = 0.0
@@ -428,10 +429,10 @@ class TurtleBotEnv(Node, gym.Env):
 
         # === Суммарная награда ===
         total_reward = (
-            1.0 * R_potential +
+            2.0 * R_potential +
             1.0 * R_intermediate +
             1.0 * R_repulsive +
-            1.0 * R_fake_path
+            0.5 * R_fake_path
         )
         # total_reward = np.clip(total_reward, -10.0, 10.0)
 
@@ -450,7 +451,7 @@ class TurtleBotEnv(Node, gym.Env):
         min_distance = float(distances.min())
         return min_distance
 
-    def get_deviation_penalty(self, current_pos, max_penalty=0.2):
+    def get_deviation_penalty(self, current_pos, max_penalty=0.1):
   
         deviation = self.compute_deviation_from_path(current_pos)
         penalty = -min(max_penalty, deviation)  # Чем дальше от пути, тем больше штраф
@@ -458,7 +459,7 @@ class TurtleBotEnv(Node, gym.Env):
 
     def step(self, action):
         cmd_msg = Twist()
-        linear = float(np.clip(action[0], 0.0, 0.26))
+        linear = float(np.clip(action[0], 0.05, 0.26))
         angular = float(np.clip(action[1], -1.82, 1.82))
 
         cmd_msg.linear.x  = linear
@@ -499,14 +500,14 @@ class TurtleBotEnv(Node, gym.Env):
         norm = np.linalg.norm(to_goal)
         to_goal /= norm if norm>0 else 1.0
         dist_forward = np.dot(disp, to_goal)              # скалярная проекция смещения
-        forward_reward = 5.0 * dist_forward
+        forward_reward = 100.0 * dist_forward
         # reward += forward_reward
 
         spin_penalty = - self.beta_spin * abs(angular)
         logger.info(f"Spin_penalty: {spin_penalty:.2f}")
 
         # Общая награда
-        reward = reward_potent_val + reward_optimal_path + forward_reward + spin_penalty + 0.01
+        reward = reward_potent_val + reward_optimal_path + forward_reward + spin_penalty - 0.01
         logger.info(f"Reward_potent_val: {reward_potent_val:.2f}")
         logger.info(f"Reward_optimal_path: {reward_optimal_path:.2f}")
         logger.info(f"Forward_reward: {forward_reward:.2f}")
@@ -531,11 +532,11 @@ class TurtleBotEnv(Node, gym.Env):
             d_wp = math.hypot(self.current_x - wp[0], self.current_y - wp[1])
             if d_wp < self.wp_threshold:
                 print('Int point reached')
-                reward +=30.0
+                reward +=50.0
                 self.wp_index += 1
 
         # 3. Достигли цели
-        if distance < 0.3:
+        if distance < 0.5:
             reward += 300  # усиленное вознаграждение
             done = True
             print("Goal reached!")
@@ -548,7 +549,7 @@ class TurtleBotEnv(Node, gym.Env):
 
         # 5. Безопасное ограничение награды
         # tot_reward = np.clip(reward * self.reward_scale, -10.0, 10.0)
-        reward *= 0.01
+        reward *= 0.1
         logger.info(f"Total_reward: {reward:.2f}")
         return state, reward, done, {}
 
@@ -586,12 +587,23 @@ class TurtleBotEnv(Node, gym.Env):
         self.prev_distance = None
         self.obstacles = []
         self.camera_obstacle_detected = False
-        self.prev_potential = 0
         self.prev_x = None
         self.prev_y = None
         self.obstacle_count = 0
         self.wp_index = 0
         self.odom_updated = False
+
+        current_x_, current_y_ = world_to_map(
+            (self.current_x, self.current_y),
+            resolution=0.05,
+            origin=(-4.86, -7.36),
+            map_offset=(45, 15),
+            map_shape=self.grid_map.shape
+        )
+
+        # goal_x, goal_y = world_to_map(goal, 0.05, (-4.86, -7.36), (45, 15), self.grid_map.shape)
+
+        self.potential_value = self.potential_field[current_y_, current_x_] 
 
         angle_to_goal = math.atan2(self.target_y - self.current_y, self.target_x - self.current_x)
         angle_diff = (angle_to_goal - self.current_yaw + np.pi) % (2 * np.pi) - np.pi
